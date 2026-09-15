@@ -1047,10 +1047,90 @@ export class OpenAIProvider extends BaseLLMProvider {
     );
   }
 
+  private isOpenRouterAnthropicModel(model: string): boolean {
+    if (!this.isOpenRouterEndpoint()) return false;
+    const m = model.toLowerCase();
+    return m.startsWith("anthropic/") || m.includes("claude");
+  }
+
   private applyOpenRouterPromptCaching(body: Record<string, unknown>, options: ChatOptions): void {
     if (!this.shouldUseOpenRouterPromptCaching(options)) return;
+    if (this.isOpenRouterAnthropicModel(options.model)) {
+      // Anthropic ignores a top-level cache_control; OpenRouter only forwards
+      // breakpoints attached to message content parts.
+      this.applyOpenRouterAnthropicCacheBreakpoints(body, options);
+      return;
+    }
     body.cache_control = { type: "ephemeral" };
     logger.debug("[OpenAI] Enabling OpenRouter prompt caching for model=%s", options.model);
+  }
+
+  /**
+   * Attach a `cache_control` breakpoint to a chat-completions message, converting
+   * string content to the multipart form when needed. Returns false when the
+   * message cannot carry a breakpoint (empty content, no text part).
+   */
+  private static markOpenRouterCacheBreakpoint(message: Record<string, unknown>): boolean {
+    const cacheControl = { type: "ephemeral" };
+    const content = message.content;
+    if (typeof content === "string") {
+      if (!content) return false;
+      message.content = [{ type: "text", text: content, cache_control: cacheControl }];
+      return true;
+    }
+    if (Array.isArray(content)) {
+      for (let i = content.length - 1; i >= 0; i--) {
+        const part = content[i] as Record<string, unknown> | undefined;
+        if (part && typeof part === "object" && part.type === "text") {
+          content[i] = { ...part, cache_control: cacheControl };
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Anthropic-style prompt caching for Claude models via OpenRouter: one
+   * breakpoint on the last system message and one on the history message
+   * `cachingAtDepth` back from the newest, mirroring anthropic.provider.ts.
+   * Keeping the marker behind the tail leaves recent (swipe/regenerate-prone)
+   * messages outside the cached prefix.
+   */
+  private applyOpenRouterAnthropicCacheBreakpoints(body: Record<string, unknown>, options: ChatOptions): void {
+    const messages = Array.isArray(body.messages) ? (body.messages as Array<Record<string, unknown>>) : [];
+    if (messages.length === 0) return;
+
+    const isSystemRole = (m: Record<string, unknown>) => m.role === "system" || m.role === "developer";
+
+    let systemMarked = false;
+    for (let i = messages.length - 1; i >= 0 && !systemMarked; i--) {
+      if (isSystemRole(messages[i]!)) {
+        systemMarked = OpenAIProvider.markOpenRouterCacheBreakpoint(messages[i]!);
+      }
+    }
+
+    const rawDepth = options.cachingAtDepth;
+    const depth = typeof rawDepth === "number" && Number.isFinite(rawDepth) && rawDepth >= 0 ? Math.floor(rawDepth) : 5;
+    const historyIndices: number[] = [];
+    for (let i = 0; i < messages.length; i++) {
+      if (!isSystemRole(messages[i]!)) historyIndices.push(i);
+    }
+    let historyMarked = false;
+    if (historyIndices.length > 0) {
+      // Tool-call messages can have null content; walk backward to the nearest markable message.
+      for (let p = Math.max(0, historyIndices.length - 1 - depth); p >= 0 && !historyMarked; p--) {
+        historyMarked = OpenAIProvider.markOpenRouterCacheBreakpoint(messages[historyIndices[p]!]!);
+      }
+    }
+
+    logger.debug(
+      "[OpenAI] OpenRouter Claude cache breakpoints for model=%s depth=%d system=%s history=%s",
+      options.model,
+      depth,
+      systemMarked,
+      historyMarked,
+    );
   }
 
   private supportsGpt5Verbosity(model: string): boolean {

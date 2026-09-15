@@ -2858,19 +2858,23 @@ export function ConnectionEditor() {
                       "ui.connections.connectioneditor.onOpenrouterAddsCacheControlForModelsThatSupportExplicitCaching",
                     )}
               </p>
-              {localProvider === "anthropic" && localEnableCaching && (
+              {localEnableCaching && (
                 <div className="mt-2 space-y-2">
-                  <SettingsSwitch
-                    label={localizeUi("ui.connections.connectioneditor.extendedTokenCaching1Hour")}
-                    checked={localAnthropicExtendedCacheTtl}
-                    onChange={(checked) => {
-                      setLocalAnthropicExtendedCacheTtl(checked);
-                      markDirty();
-                    }}
-                  />
-                  <p className="px-2 text-[0.625rem] text-[var(--muted-foreground)]">
-                    {localizeUi("ui.connections.connectioneditor.keepsAnthropicCacheEntriesAliveForOneHourInstead")}
-                  </p>
+                  {localProvider === "anthropic" && (
+                    <>
+                      <SettingsSwitch
+                        label={localizeUi("ui.connections.connectioneditor.extendedTokenCaching1Hour")}
+                        checked={localAnthropicExtendedCacheTtl}
+                        onChange={(checked) => {
+                          setLocalAnthropicExtendedCacheTtl(checked);
+                          markDirty();
+                        }}
+                      />
+                      <p className="px-2 text-[0.625rem] text-[var(--muted-foreground)]">
+                        {localizeUi("ui.connections.connectioneditor.keepsAnthropicCacheEntriesAliveForOneHourInstead")}
+                      </p>
+                    </>
+                  )}
                   <label className="flex items-center justify-between gap-3 rounded-xl bg-[var(--secondary)]/40 px-3 py-2 ring-1 ring-[var(--border)]">
                     <div className="min-w-0">
                       <span className="block text-sm font-medium">

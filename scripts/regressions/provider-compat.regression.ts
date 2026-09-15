@@ -389,10 +389,56 @@ try {
     enableCaching: true,
     suppressModelParameters: true,
   });
+  const claudeConversation: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
+    { role: "system", content: "You are a roleplay narrator." },
+    ...Array.from({ length: 8 }, (_, i) => ({
+      role: (i % 2 === 0 ? "user" : "assistant") as "user" | "assistant",
+      content: `turn ${i + 1}`,
+    })),
+  ];
+  await provider.chatComplete(claudeConversation, {
+    model: "anthropic/claude-sonnet-4.5",
+    stream: false,
+    enableCaching: true,
+    cachingAtDepth: 2,
+  });
+  await provider.chatComplete(claudeConversation, {
+    model: "anthropic/claude-sonnet-4.5",
+    stream: false,
+    enableCaching: false,
+  });
+  // Gemini keeps the top-level cache_control hint (including with suppressed model parameters)
   assert.deepEqual(openRouterCachingRequestBodies[0]?.cache_control, { type: "ephemeral" });
   assert.equal("cache_control" in (openRouterCachingRequestBodies[1] ?? {}), false);
   assert.deepEqual(openRouterCachingRequestBodies[2]?.cache_control, { type: "ephemeral" });
   assert.deepEqual(openRouterCachingRequestBodies[3]?.cache_control, { type: "ephemeral" });
+  // Claude: no top-level hint; breakpoints on message content parts instead
+  const claudeCachedBody = openRouterCachingRequestBodies[4] ?? {};
+  assert.equal("cache_control" in claudeCachedBody, false);
+  const claudeCachedMessages = claudeCachedBody.messages as Array<{
+    role: string;
+    content: string | Array<{ type: string; text: string; cache_control?: { type: string } }>;
+  }>;
+  assert.equal(claudeCachedMessages.length, 9);
+  // System breakpoint: last system message becomes multipart with cache_control on its last part
+  const systemContent = claudeCachedMessages[0]!.content;
+  assert.ok(Array.isArray(systemContent));
+  assert.deepEqual(systemContent[systemContent.length - 1]?.cache_control, { type: "ephemeral" });
+  // History breakpoint: depth 2 from the newest of 8 non-system messages → index 5 → overall index 6
+  const historyContent = claudeCachedMessages[6]!.content;
+  assert.ok(Array.isArray(historyContent));
+  assert.deepEqual(historyContent[historyContent.length - 1]?.cache_control, { type: "ephemeral" });
+  // Every other message stays plain string content
+  for (const [index, message] of claudeCachedMessages.entries()) {
+    if (index === 0 || index === 6) continue;
+    assert.equal(typeof message.content, "string");
+  }
+  // Caching disabled: nothing gets a breakpoint anywhere
+  const claudeUncachedBody = openRouterCachingRequestBodies[5] ?? {};
+  assert.equal("cache_control" in claudeUncachedBody, false);
+  for (const message of claudeUncachedBody.messages as Array<{ content: unknown }>) {
+    assert.equal(typeof message.content, "string");
+  }
 } finally {
   await new Promise<void>((resolve, reject) =>
     openRouterCachingServer.close((error) => (error ? reject(error) : resolve())),
