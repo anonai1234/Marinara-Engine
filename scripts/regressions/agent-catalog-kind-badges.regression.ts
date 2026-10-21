@@ -24,6 +24,13 @@ assert.match(
 assert.match(catalogViewSource, /(?:"beholder"|beholder):\s*\[\s*"roleplay"\s*\]/u);
 assert.match(catalogViewSource, /(?:"gacha-forge"|gacha-forge):\s*\[\s*"conversation",\s*"roleplay",\s*"game"\s*\]/u);
 assert.match(catalogViewSource, /(?:"slurp"|slurp):\s*\[\s*"conversation",\s*"roleplay",\s*"game"\s*\]/u);
+for (const avatarPackageId of ["2d-avatars", "3d-avatars"]) {
+  assert.match(
+    catalogViewSource,
+    new RegExp(`"${avatarPackageId}":\\s*\\[\\s*"roleplay",\\s*"game"\\s*\\]`, "u"),
+    `${avatarPackageId} must stay listed under the Roleplay and Game catalog filters`,
+  );
+}
 assert.match(
   catalogViewSource,
   /const modes = packageModes\(entry\.manifest\.id\);[\s\S]*?data-agent-catalog-mode-badges[\s\S]*?modes\.map/u,
@@ -31,8 +38,8 @@ assert.match(
 );
 assert.match(
   appShellSource,
-  /MOBILE_SHELL_PANEL_BOTTOM_PADDING_CLASS\s*=\s*\n?\s*"pb-\[min\(max\(env\(safe-area-inset-bottom\),0\.5rem\),3rem\)\]"/u,
-  "Mobile shell panels must cap broken browser safe-area insets",
+  /MOBILE_SHELL_PANEL_BOTTOM_PADDING_CLASS\s*=\s*\n?\s*"pb-\[min\(max\(var\(--mari-safe-area-inset-bottom,env\(safe-area-inset-bottom\)\),0\.5rem\),3rem\)\]"/u,
+  "Mobile shell panels must cap broken browser safe-area insets and honor the safe-area override hook",
 );
 
 console.info("Agent catalog kind badge regressions passed.");

@@ -3,7 +3,7 @@
 // ──────────────────────────────────────────────
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api-client";
-import { chatKeys, syncCachedChat } from "./use-chats";
+import { captureChatMetadataVersion, chatKeys, guardServerChatSnapshot, syncCachedChat } from "./use-chats";
 import type { Chat, ChatMode, ChatPreset, ChatPresetSettings } from "@marinara-engine/shared";
 
 export const chatPresetKeys = {
@@ -87,9 +87,26 @@ export function useApplyChatPreset() {
         `/chat-presets/${presetId}/apply/${chatId}`,
         connectionId !== undefined ? { connectionId } : undefined,
       ),
-    onSuccess: (data, variables) => {
-      if (data) syncCachedChat(qc, data);
+    onMutate: ({ chatId }) => ({ metadataVersion: captureChatMetadataVersion(chatId) }),
+    onSuccess: (data, variables, context) => {
+      if (data) syncCachedChat(qc, guardServerChatSnapshot(qc, data, context?.metadataVersion ?? 0));
       qc.invalidateQueries({ queryKey: chatKeys.detail(variables.chatId) });
+      qc.invalidateQueries({ queryKey: chatKeys.list() });
+      qc.invalidateQueries({ queryKey: [...chatKeys.all, "group"] });
+    },
+  });
+}
+
+/** After saving a profile, update the chat settings of the other chats that use it. */
+export function useApplyChatPresetToFollowers() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ presetId, exceptChatId }: { presetId: string; exceptChatId: string }) =>
+      api.post<{ updated: number; chatIds: string[]; failed: number }>(`/chat-presets/${presetId}/apply-to-followers`, {
+        exceptChatId,
+      }),
+    onSuccess: ({ chatIds }) => {
+      for (const chatId of chatIds) qc.invalidateQueries({ queryKey: chatKeys.detail(chatId) });
       qc.invalidateQueries({ queryKey: chatKeys.list() });
       qc.invalidateQueries({ queryKey: [...chatKeys.all, "group"] });
     },

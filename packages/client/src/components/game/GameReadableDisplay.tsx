@@ -148,7 +148,7 @@ export function GameReadableDisplay({ type, content, onClose }: GameReadableDisp
 
   return (
     <div
-      className="fixed inset-y-0 z-[90] flex items-center justify-center bg-black/70 p-3 pb-[max(env(safe-area-inset-bottom),0.75rem)] pt-[max(env(safe-area-inset-top),0.75rem)] backdrop-blur-md sm:p-4"
+      className="fixed inset-y-0 z-[90] flex items-center justify-center bg-black/70 p-3 pb-[max(var(--mari-safe-area-inset-bottom,env(safe-area-inset-bottom)),0.75rem)] pt-[max(env(safe-area-inset-top),0.75rem)] backdrop-blur-md sm:p-4"
       style={{
         left: "var(--mari-chat-ui-inset-left, 0px)",
         right: "var(--mari-chat-ui-inset-right, 0px)",
@@ -177,7 +177,7 @@ export function GameReadableDisplay({ type, content, onClose }: GameReadableDisp
         </div>
 
         {/* Content */}
-        <div className="flex-1 overflow-y-auto px-6 py-4">
+        <div className="flex-1 overflow-y-auto px-6 py-4 [overflow-wrap:anywhere]">
           <div
             className={cn("whitespace-pre-wrap", style.inner)}
             dangerouslySetInnerHTML={{ __html: formattedContent }}

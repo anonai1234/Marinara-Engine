@@ -232,6 +232,7 @@ export function RegexScriptEditor() {
   const { t: localizeUi } = useUiTranslation();
   const regexDetailId = useUIStore((s) => s.regexDetailId);
   const regexDetailDefaultCharacterIds = useUIStore((s) => s.regexDetailDefaultCharacterIds);
+  const regexDetailDefaultPresetIds = useUIStore((s) => s.regexDetailDefaultPresetIds);
   const regexDetailReturn = useUIStore((s) => s.regexDetailReturn);
   const closeRegexDetail = useUIStore((s) => s.closeRegexDetail);
   const openRegexDetail = useUIStore((s) => s.openRegexDetail);
@@ -331,8 +332,9 @@ export function RegexScriptEditor() {
       setLocalTargetCharacterIds(targetCharacterIds);
       setLocalCharacterScopeEnabled(targetCharacterIds.length > 0);
       const targetPromptPresetIds = parseStringArray(dbRow.targetPromptPresetIds);
-      setLocalTargetPromptPresetIds(targetPromptPresetIds);
-      setLocalPromptPresetScopeEnabled(targetPromptPresetIds.length > 0);
+      const presetScope = [...new Set([...targetPromptPresetIds, ...(regexDetailDefaultPresetIds ?? [])])];
+      setLocalTargetPromptPresetIds(presetScope);
+      setLocalPromptPresetScopeEnabled(presetScope.length > 0);
       setLocalOrder(dbRow.order);
       setLocalMinDepth(dbRow.minDepth);
       setLocalMaxDepth(dbRow.maxDepth);
@@ -350,16 +352,19 @@ export function RegexScriptEditor() {
       const defaultScope = regexDetailDefaultCharacterIds ?? [];
       setLocalTargetCharacterIds(defaultScope);
       setLocalCharacterScopeEnabled(defaultScope.length > 0);
-      setLocalTargetPromptPresetIds([]);
-      setLocalPromptPresetScopeEnabled(false);
+      setLocalTargetPromptPresetIds(regexDetailDefaultPresetIds ?? []);
+      setLocalPromptPresetScopeEnabled((regexDetailDefaultPresetIds?.length ?? 0) > 0);
       setLocalOrder(0);
       setLocalMinDepth(null);
       setLocalMaxDepth(null);
     }
-    setDirty(false);
+    setDirty(
+      !!dbRow &&
+        (regexDetailDefaultPresetIds ?? []).some((id) => !parseStringArray(dbRow.targetPromptPresetIds).includes(id)),
+    );
     setSaveError(null);
     setTestInput("");
-  }, [regexDetailId, dbRow, regexDetailDefaultCharacterIds]);
+  }, [regexDetailId, dbRow, regexDetailDefaultCharacterIds, regexDetailDefaultPresetIds]);
 
   // Regex validity check
   const regexError = useMemo(() => {
@@ -459,6 +464,10 @@ export function RegexScriptEditor() {
         const updatePayload = { ...payload };
         if (dbRow.findRegex === localFindRegex) delete updatePayload.findRegex;
         await updateScript.mutateAsync({ id: dbRow.id, ...updatePayload });
+        // Preset targets supplied by navigation are a one-shot draft, not a permanent constraint.
+        if (useUIStore.getState().regexDetailId === dbRow.id) {
+          useUIStore.setState({ regexDetailDefaultPresetIds: null });
+        }
       } else {
         const created = (await createScript.mutateAsync(payload)) as RegexScriptRow | undefined;
         if (created?.id) {
@@ -684,7 +693,7 @@ export function RegexScriptEditor() {
                 await handleSave();
                 closeRegexDetail();
               }}
-              className="rounded-lg bg-amber-500/20 px-3 py-1 hover:bg-amber-500/30"
+              className="rounded-lg bg-[var(--marinara-app-accent-static)]/20 px-3 py-1 text-[var(--marinara-app-accent-static)] hover:bg-[var(--marinara-app-accent-static)]/30"
             >
               {localizeUi("ui.agents.agenteditor.saveClose")}
             </button>
@@ -697,7 +706,11 @@ export function RegexScriptEditor() {
         <div className="flex items-center gap-2 bg-red-500/10 px-4 py-2 text-xs text-red-400">
           <AlertCircle size="0.8125rem" />
           <span className="flex-1">{saveError}</span>
-          <button onClick={() => setSaveError(null)} className="rounded-lg px-2 py-0.5 hover:bg-red-500/20">
+          <button
+            onClick={() => setSaveError(null)}
+            aria-label={localizeUi("editor.save.dismissError")}
+            className="rounded-lg px-2 py-0.5 text-[var(--marinara-app-accent-static)] hover:bg-[var(--marinara-app-accent-static)]/20"
+          >
             <X size="0.75rem" />
           </button>
         </div>

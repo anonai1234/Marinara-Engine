@@ -8,6 +8,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
   Bot,
+  Braces,
   ChevronDown,
   Eye,
   EyeOff,
@@ -19,7 +20,8 @@ import {
   Wand2,
 } from "lucide-react";
 import { toast } from "sonner";
-import type { Chat, GameState } from "@marinara-engine/shared";
+import { AgentOutputSpoiler } from "../agents/AgentOutputSpoiler";
+import { estimateTextTokens, type Chat, type GameState } from "@marinara-engine/shared";
 import {
   useAgentMemory,
   useAgentSuiteRewrite,
@@ -41,10 +43,17 @@ import {
 } from "../../lib/chat-lorebooks";
 import { getChatCharacterIds } from "../../lib/chat-macros";
 import { filterLanguageGenerationConnections } from "../../lib/connection-filters";
-import { AGENT_SUITE_TRACKER_SLICES } from "../../lib/agent-suite-tracker-slices";
+import {
+  AGENT_SUITE_TRACKER_SLICES,
+  trackerSliceErrorMessage,
+  trackerSlicePatchError,
+} from "../../lib/agent-suite-tracker-slices";
 import { cn } from "../../lib/utils";
 import { useAgentStore } from "../../stores/agent.store";
 import { useChatStore } from "../../stores/chat.store";
+import { parseStateDraft } from "../../lib/state-editor/state-editor-json";
+import { StateJsonField } from "../ui/state-editor/StateJsonField";
+import { useUIStore } from "../../stores/ui.store";
 import { useGameStateStore } from "../../stores/game-state.store";
 import { Modal } from "../ui/Modal";
 import { useTranslation as useUiTranslation } from "react-i18next";
@@ -182,6 +191,14 @@ function DataBlock({
   const currentText = draft ?? value;
   const isDirty = draft !== null && draft !== value;
   const busy = saving || rewrite.isPending;
+  // JSON drafts are checked as they are typed, like the State Editor, so a typo shows before Save.
+  const jsonError = useMemo(() => {
+    if (mode !== "json" || !isDirty) return null;
+    const parsed = parseStateDraft(currentText);
+    if (parsed.ok) return null;
+    const lead = localizeUi("ui.stateEditor.editor.invalidJson");
+    return parsed.error ? `${lead} ${parsed.error}` : lead;
+  }, [currentText, isDirty, localizeUi, mode]);
 
   // Report dirty state so the modal can guard close/agent-switch transitions.
   useEffect(() => {
@@ -319,20 +336,39 @@ function DataBlock({
         </button>
       </div>
 
-      <textarea
-        ref={textareaRef}
-        value={currentText}
-        onChange={(event) => {
-          setDraft(event.target.value);
-          setError(null);
-          setSelection(null);
-        }}
-        onSelect={captureSelection}
-        disabled={disabled || busy}
-        rows={Math.min(14, Math.max(3, currentText.split("\n").length))}
-        spellCheck={false}
-        className="mt-2 w-full resize-y rounded-md border border-[var(--input)] bg-[var(--secondary)]/45 px-2 py-1.5 font-mono text-[0.625rem] leading-relaxed text-[var(--foreground)] outline-none transition-colors focus:border-[var(--ring)] focus:ring-1 focus:ring-[var(--ring)] disabled:opacity-60"
-      />
+      {mode === "json" ? (
+        <StateJsonField
+          compact
+          value={currentText}
+          onChange={(text) => {
+            setDraft(text);
+            setError(null);
+            setSelection(null);
+          }}
+          ariaLabel={label}
+          invalid={jsonError !== null}
+          disabled={disabled || busy}
+          rows={Math.min(14, Math.max(3, currentText.split("\n").length))}
+          textareaRef={textareaRef}
+          onSelect={captureSelection}
+          className="mt-2"
+        />
+      ) : (
+        <textarea
+          ref={textareaRef}
+          value={currentText}
+          onChange={(event) => {
+            setDraft(event.target.value);
+            setError(null);
+            setSelection(null);
+          }}
+          onSelect={captureSelection}
+          disabled={disabled || busy}
+          rows={Math.min(14, Math.max(3, currentText.split("\n").length))}
+          spellCheck={false}
+          className="mt-2 w-full resize-y rounded-md border border-[var(--input)] bg-[var(--secondary)]/45 px-2 py-1.5 font-mono text-[0.625rem] leading-relaxed text-[var(--foreground)] outline-none transition-colors focus:border-[var(--ring)] focus:ring-1 focus:ring-[var(--ring)] disabled:opacity-60"
+        />
+      )}
 
       {aiOpen && (
         <div
@@ -406,7 +442,11 @@ function DataBlock({
         </div>
       )}
 
-      {error && <div className="mt-1.5 text-[0.5625rem] text-[var(--destructive)]">{error}</div>}
+      {(error ?? jsonError) && (
+        <div role="alert" className="mt-1.5 text-[0.5625rem] text-[var(--marinara-app-accent-static)]">
+          {error ?? jsonError}
+        </div>
+      )}
 
       <div className="mt-2 flex items-center justify-end gap-1.5">
         <button
@@ -425,7 +465,7 @@ function DataBlock({
         <button
           type="button"
           onClick={handleSave}
-          disabled={disabled || !isDirty || busy}
+          disabled={disabled || !isDirty || busy || jsonError !== null}
           className="inline-flex min-h-7 items-center gap-1 rounded-md bg-[var(--primary)] px-2.5 py-1 text-[0.625rem] font-medium text-[var(--primary-foreground)] transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--ring)] disabled:cursor-not-allowed disabled:opacity-50"
         >
           {saving ? <Loader2 size="0.625rem" className="animate-spin" /> : <Save size="0.625rem" />}
@@ -644,6 +684,10 @@ export function AgentSuiteModal({ chat, open, onClose, onCloseGuardChange, agent
     () => selectedContextSources.reduce((total, source) => total + source.content.length, 0),
     [selectedContextSources],
   );
+  const contextTotalTokens = useMemo(
+    () => estimateTextTokens(selectedContextSources.map((source) => source.content).join("")),
+    [selectedContextSources],
+  );
   const contextOverLimit =
     selectedContextSources.length > MAX_CONTEXT_SECTIONS || contextTotalChars > MAX_CONTEXT_TOTAL_CHARS;
 
@@ -715,7 +759,8 @@ export function AgentSuiteModal({ chat, open, onClose, onCloseGuardChange, agent
       if (!snapshot) throw new Error("No tracker snapshot to update");
       qc.setQueryData(gameStateKey, snapshot);
       const patch = slice.buildPatch(snapshot, JSON.parse(draftText));
-      if ("error" in patch && typeof patch.error === "string") throw new Error(patch.error);
+      const sliceError = trackerSlicePatchError(patch);
+      if (sliceError) throw new Error(trackerSliceErrorMessage(sliceError, localizeUi));
       // Target the exact row the snapshot came from, like use-game-state-patcher.
       await api.patch(`/chats/${chat.id}/game-state`, {
         ...patch,
@@ -727,7 +772,7 @@ export function AgentSuiteModal({ chat, open, onClose, onCloseGuardChange, agent
       });
       await refreshGameState();
     },
-    [chat.id, gameStateKey, qc, refreshGameState],
+    [chat.id, gameStateKey, localizeUi, qc, refreshGameState],
   );
 
   const clearAgentMemory = useCallback(async () => {
@@ -816,7 +861,7 @@ export function AgentSuiteModal({ chat, open, onClose, onCloseGuardChange, agent
                     />
                     <span className="min-w-0 flex-1 truncate">{source.display}</span>
                     <span className="shrink-0 text-[0.5rem] text-[var(--muted-foreground)]">
-                      ~{Math.ceil(source.content.length / 4).toLocaleString()}{" "}
+                      ~{estimateTextTokens(source.content).toLocaleString()}{" "}
                       {localizeUi("ui.agents.agenteditor.tokens")}
                     </span>
                   </label>
@@ -836,7 +881,7 @@ export function AgentSuiteModal({ chat, open, onClose, onCloseGuardChange, agent
           {selectedContextSources.length} {localizeUi("ui.chat.agentsuitemodal.source")}
           {selectedContextSources.length === 1 ? "" : localizeUi("ui.noodle.stageprofileview.s")}{" "}
           {localizeUi("ui.chat.agentsuitemodal.attached")}
-          {Math.ceil(contextTotalChars / 4).toLocaleString()} {localizeUi("ui.agents.agenteditor.tokens")}
+          {contextTotalTokens.toLocaleString()} {localizeUi("ui.agents.agenteditor.tokens")}
           {contextOverLimit &&
             ` — too large (max ${MAX_CONTEXT_SECTIONS} sources / ${MAX_CONTEXT_TOTAL_CHARS.toLocaleString()} characters), deselect some sources`}
         </p>
@@ -991,9 +1036,25 @@ export function AgentSuiteModal({ chat, open, onClose, onCloseGuardChange, agent
                 {/* Tracker slice */}
                 {trackerSlice && (
                   <section className="space-y-2">
-                    <h4 className="text-[0.6875rem] font-semibold text-[var(--muted-foreground)]">
-                      {localizeUi("ui.chat.agentsuitemodal.trackerData")}
-                    </h4>
+                    <div className="flex items-center justify-between gap-2">
+                      <h4 className="text-[0.6875rem] font-semibold text-[var(--muted-foreground)]">
+                        {localizeUi("ui.chat.agentsuitemodal.trackerData")}
+                      </h4>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          useUIStore.getState().openModal("game-state-editor", {
+                            chatId: chat.id,
+                            // The selected agent's tracker is one section of the editor: open there.
+                            initialSectionId: selectedAgent?.id,
+                          })
+                        }
+                        className="inline-flex min-h-7 items-center gap-1 rounded-md px-2 py-1 text-[0.625rem] font-medium text-[var(--muted-foreground)] transition-colors hover:bg-[var(--accent)] hover:text-[var(--foreground)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--ring)]"
+                      >
+                        <Braces size="0.6875rem" />
+                        {localizeUi("ui.chat.agentsuitemodal.openStateEditor")}
+                      </button>
+                    </div>
                     {gameStateQuery.isLoading && (
                       <p className="py-2 text-center text-[0.625rem] text-[var(--muted-foreground)]">
                         {localizeUi("ui.chat.agentsuitemodal.loadingTrackerData")}
@@ -1069,28 +1130,30 @@ export function AgentSuiteModal({ chat, open, onClose, onCloseGuardChange, agent
                     {customRuns.map((run) => {
                       const mode: "text" | "json" = typeof run.resultData === "string" ? "text" : "json";
                       return (
-                        <DataBlock
-                          key={run.id}
-                          blockId={run.id}
-                          label={run.resultType.replace(/_/g, " ")}
-                          description={formatRunTimestamp(run.createdAt)}
-                          mode={mode}
-                          value={serializeValue(run.resultData, mode)}
-                          onSave={async (draftText) => {
-                            const parsed: unknown = mode === "json" ? JSON.parse(draftText) : draftText;
-                            await updateRunData.mutateAsync({ id: run.id, chatId: chat.id, resultData: parsed });
-                          }}
-                          onDirtyChange={handleBlockDirtyChange}
-                          disabled={isAgentProcessing}
-                          agentName={selectedAgent.name}
-                          connectionOptions={connectionOptions}
-                          rewriteConnectionId={effectiveRewriteConnectionId}
-                          onRewriteConnectionChange={setRewriteConnectionId}
-                          contextPicker={contextPicker}
-                          contextCount={selectedContextSources.length}
-                          contextOverLimit={contextOverLimit}
-                          buildContextSections={buildContextSections}
-                        />
+                        <AgentOutputSpoiler key={run.id} hidden={run.hideOutput}>
+                          <DataBlock
+                            key={run.id}
+                            blockId={run.id}
+                            label={run.resultType.replace(/_/g, " ")}
+                            description={formatRunTimestamp(run.createdAt)}
+                            mode={mode}
+                            value={serializeValue(run.resultData, mode)}
+                            onSave={async (draftText) => {
+                              const parsed: unknown = mode === "json" ? JSON.parse(draftText) : draftText;
+                              await updateRunData.mutateAsync({ id: run.id, chatId: run.chatId, resultData: parsed });
+                            }}
+                            onDirtyChange={handleBlockDirtyChange}
+                            disabled={isAgentProcessing}
+                            agentName={selectedAgent.name}
+                            connectionOptions={connectionOptions}
+                            rewriteConnectionId={effectiveRewriteConnectionId}
+                            onRewriteConnectionChange={setRewriteConnectionId}
+                            contextPicker={contextPicker}
+                            contextCount={selectedContextSources.length}
+                            contextOverLimit={contextOverLimit}
+                            buildContextSections={buildContextSections}
+                          />
+                        </AgentOutputSpoiler>
                       );
                     })}
                   </section>

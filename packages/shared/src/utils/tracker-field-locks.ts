@@ -16,12 +16,14 @@ import {
   normalizeWorldCustomFields,
 } from "../constants/tracker-custom-field-icons.js";
 import { excludeInventoryTrackerCarriedDuplicates } from "./inventory-tracker-rows.js";
+import { isTrackerRowsUpdate, resolveTrackerRowsUpdate } from "./tracker-updates.js";
+import { normalizeTextForMatch } from "./text-matching.js";
 
 type WorldTrackerField = "date" | "time" | "location" | "weather" | "temperature";
 type TextCharacterField = "emoji" | "name" | "mood" | "appearance" | "outfit" | "thoughts";
 type StatField = "name" | "value" | "max";
 type InventoryField = "name" | "quantity" | "description" | "location";
-type InventoryTrackerField = "name" | "qty";
+type InventoryTrackerField = "name" | "qty" | "description" | "location";
 export type InventoryTrackerGroup = "currencies" | "equipped" | "inventory";
 type QuestField = "name" | "completed" | "currentStage";
 type QuestObjectiveField = "text" | "completed";
@@ -621,6 +623,7 @@ function findCurrentCharacterMatch(
   currentCharacters: PresentCharacter[],
   fallbackIndex: number,
   usedCurrent: Set<number>,
+  reportedIds: ReadonlySet<string>,
 ) {
   const id = typeof next.characterId === "string" ? next.characterId.trim() : "";
   if (id) {
@@ -629,15 +632,28 @@ function findCurrentCharacterMatch(
     );
     if (byId >= 0) return { index: byId, matchedByIdentity: true };
   }
+  // Exact IDs own their rows. Names and positions may only claim an unreserved compatible identity.
+  const available = (character: PresentCharacter, index: number) => {
+    const currentId = typeof character.characterId === "string" ? character.characterId.trim() : "";
+    const castId = `${currentId}:cast:${normalizeTextForMatch(character.name)}`;
+    return (
+      !usedCurrent.has(index) &&
+      (!currentId || (!reportedIds.has(currentId) && (!reportedIds.has(castId) || id === castId))) &&
+      (!id || !currentId || id === castId)
+    );
+  };
   const name = normalizeComparableText(next.name);
   if (name) {
     const byName = currentCharacters.findIndex((character, index) => {
-      return !usedCurrent.has(index) && normalizeComparableText(character.name) === name;
+      return available(character, index) && normalizeComparableText(character.name) === name;
     });
     if (byName >= 0) return { index: byName, matchedByIdentity: true };
   }
   return {
-    index: fallbackIndex < currentCharacters.length && !usedCurrent.has(fallbackIndex) ? fallbackIndex : -1,
+    index:
+      fallbackIndex < currentCharacters.length && available(currentCharacters[fallbackIndex]!, fallbackIndex)
+        ? fallbackIndex
+        : -1,
     matchedByIdentity: false,
   };
 }
@@ -765,9 +781,9 @@ function mergeRoleplayInventoryTrackerRowsWithLocks(
   return mergeNamedRowsWithLocks(nextRows, currentRows, locks, {
     mergeRow: (row, currentRow, currentIndex) => {
       const next = { ...row };
-      for (const field of ["name", "qty"] as const) {
+      for (const field of ["name", "qty", "description", "location"] as const) {
         if (isTrackerFieldLocked(locks, roleplayInventoryTrackerLockKey(group, currentRow, field, currentIndex))) {
-          if (field === "qty" && currentRow.qty === undefined) delete next.qty;
+          if (currentRow[field] === undefined) delete next[field];
           else next[field] = currentRow[field] as never;
         }
       }
@@ -961,6 +977,7 @@ function mergeWorldCustomFieldsWithLocks(
   nextFields: WorldCustomField[],
   currentFields: WorldCustomField[] | null | undefined,
   locks: TrackerFieldLocks,
+  preserveMissing = true,
 ) {
   const current = normalizeWorldCustomFields(currentFields);
   const nextNormalizedFields = normalizeWorldCustomFields(nextFields);
@@ -971,18 +988,24 @@ function mergeWorldCustomFieldsWithLocks(
   });
 
   const currentNames = new Set(current.map((field) => normalizeComparableText(field.name)));
-  const merged = current.map((field, index) => {
+  const merged = current.flatMap((field, index) => {
     const next = nextByName.get(normalizeComparableText(field.name));
-    if (!next) return field;
+    if (!next) {
+      return preserveMissing || hasLockWithPrefix(locks, `${worldCustomFieldTrackerLockPrefix(field, index)}.`)
+        ? [field]
+        : [];
+    }
     const valueLocked = isTrackerFieldLocked(locks, worldCustomFieldTrackerLockKey(field, "value", index));
-    return {
-      name: field.name,
-      value: valueLocked ? field.value : next.value,
-      icon:
-        field.icon && field.icon !== DEFAULT_WORLD_CUSTOM_FIELD_ICON
-          ? field.icon
-          : (next.icon ?? DEFAULT_WORLD_CUSTOM_FIELD_ICON),
-    };
+    return [
+      {
+        name: field.name,
+        value: valueLocked ? field.value : next.value,
+        icon:
+          field.icon && field.icon !== DEFAULT_WORLD_CUSTOM_FIELD_ICON
+            ? field.icon
+            : (next.icon ?? DEFAULT_WORLD_CUSTOM_FIELD_ICON),
+      },
+    ];
   });
 
   nextNormalizedFields.forEach((field) => {
@@ -999,8 +1022,11 @@ function mergeCharactersWithLocks(
 ) {
   const current = currentCharacters ?? [];
   const usedCurrent = new Set<number>();
+  const reportedIds = new Set(
+    nextCharacters.map((character) => (typeof character.characterId === "string" ? character.characterId.trim() : "")),
+  );
   const merged = nextCharacters.map((character, index) => {
-    const match = findCurrentCharacterMatch(character, current, index, usedCurrent);
+    const match = findCurrentCharacterMatch(character, current, index, usedCurrent, reportedIds);
     const currentIndex = match.index;
     const currentCharacter = currentIndex >= 0 ? current[currentIndex] : null;
     if (!currentCharacter) return character;
@@ -1013,6 +1039,16 @@ function mergeCharactersWithLocks(
     }
     usedCurrent.add(currentIndex);
     const next = { ...character };
+    // Locks are keyed by the row's id, so a locked row the agent finds by name keeps that id, whether the
+    // agent left it out or sent another one, such as a cast id for the same card (#7689).
+    const currentId = typeof currentCharacter.characterId === "string" ? currentCharacter.characterId.trim() : "";
+    if (
+      currentId &&
+      !nextCharacters.some((other) => other.characterId === currentCharacter.characterId) &&
+      hasLockWithPrefix(locks, `${characterTrackerLockPrefix(currentCharacter, currentIndex)}.`)
+    ) {
+      next.characterId = currentCharacter.characterId;
+    }
     for (const field of ["emoji", "name", "mood", "appearance", "outfit", "thoughts"] as const) {
       if (isTrackerFieldLocked(locks, characterTrackerLockKey(currentCharacter, currentIndex, field))) {
         next[field] = currentCharacter[field] as never;
@@ -1046,9 +1082,14 @@ export function applyTrackerFieldLocksToGameStatePatch<T extends Record<string, 
   fieldLocks: TrackerFieldLocks | null | undefined = currentState?.fieldLocks,
 ): T {
   const locks = normalizeEffectiveTrackerFieldLocks(fieldLocks, currentState);
-  if (!currentState) return patch;
-
   const next = { ...patch } as Record<string, unknown>;
+  const incrementalWorldFields = isTrackerRowsUpdate(next.worldCustomFields);
+  if (incrementalWorldFields) {
+    next.worldCustomFields = normalizeWorldCustomFields(
+      resolveTrackerRowsUpdate(next.worldCustomFields, currentState?.worldCustomFields ?? []),
+    );
+  }
+  if (!currentState) return next as T;
   for (const field of ["date", "time", "location", "weather", "temperature"] as const) {
     if (field in next && isTrackerFieldLocked(locks, worldTrackerLockKey(field))) {
       next[field] = currentState[field];
@@ -1060,6 +1101,7 @@ export function applyTrackerFieldLocksToGameStatePatch<T extends Record<string, 
       next.worldCustomFields as WorldCustomField[],
       currentState.worldCustomFields,
       locks,
+      !incrementalWorldFields,
     );
   }
 
