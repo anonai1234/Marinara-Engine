@@ -10,13 +10,38 @@
 // GM wrote survives whichever side does the rolling.
 // ──────────────────────────────────────────────
 
+import { z } from "zod";
 import type { GameDicePoolSlotName, SkillCheckResult } from "../types/game.js";
 import { parsePoolSlotName } from "./dice-pool.js";
 import { isWithinDiceLimits, parseDiceNotation } from "./dice-notation.js";
 
 export interface SkillCheckTag {
   skill: string;
-  dc: number;
+  /**
+   * `dc=` as written. Absent only on a tag that names its difficulty by `difficulty=` instead, which
+   * only a ruleset game can turn into a number; every other reader treats such a tag as a check it
+   * cannot roll.
+   */
+  dc?: number;
+  /**
+   * `difficulty="Label"` as the GM wrote it: a step of the ruleset's difficulty ladder, picked by
+   * name. Carried, never judged: whether the ladder has such a step is the resolver's business.
+   */
+  difficulty?: string;
+  /**
+   * `explode=` and `double=` as whole numbers, when the GM wrote readable ones: the face a pool
+   * ruleset's moving rule fires on for this one check. Carried, never judged, like `threshold=`.
+   */
+  explode?: number;
+  double?: number;
+  /** `reroll="id"` as the GM wrote it: one of the ruleset's standing re-throws, by its id. Carried,
+   *  never judged: whether the ruleset has one by that name is the resolver's business. */
+  reroll?: string;
+  /** `reason="untrained"`: the Engine did not roll this check, because the ruleset does not let
+   *  the character attempt it untrained. Settled, not owed: the client's fallback and the roll
+   *  endpoint's record never roll it later. Only the Engine writes it, but the Game Master could
+   *  copy it, so a turn's own pass ignores it and decides again from the sheet. */
+  reason?: "untrained";
   advantage?: boolean;
   disadvantage?: boolean;
   resolvedResult?: SkillCheckResult;
@@ -57,6 +82,52 @@ export interface SkillCheckTag {
    * rule cannot see. An unreadable name costs the tag a `slot` mismatch instead.
    */
   poolDeclared?: boolean;
+  /**
+   * `who=` as the GM wrote it: the party member a ruleset game rolls the check for. Absent means
+   * the player. Carried, never judged: only a game with a pinned ruleset reads it, and whether
+   * the name matches a sheet is the resolver's business.
+   */
+  who?: string;
+  /**
+   * `with=` as the GM wrote it: roll this skill or save with another ability than its own. Carried,
+   * never judged — whether the ruleset has such an ability is the resolver's business, and a name
+   * no ability answers to is ignored there rather than refused here.
+   */
+  withAbility?: string;
+  /**
+   * `bonus=` as a whole number, when the GM wrote a readable one: dice a pool ruleset adds or
+   * takes for this one check. Read like `threshold=` and held to the same rule — `Number` rather
+   * than `parseInt`, so "1.5" stays unusable instead of becoming 1, and whether the ruleset allows
+   * situational dice at all is decided by the resolver.
+   */
+  bonusDice?: number;
+  /** `dark="2"`: the dark dice the Game Master adds to a keep-the-highest check (1.138), where the
+   *  ruleset has them. Read like `bonus=`; the resolver holds it to the ruleset's `dark.max`. */
+  darkDice?: number;
+  /** `upgrade=` turns difficulty dice into challenge dice (1.141). */
+  upgrades?: number;
+  /** Independent setback dice and optional own-pool upgrades (1.150). */
+  setback?: number;
+  upgradeOwn?: number;
+  /**
+   * `spend="willpower:1"` as the GM wrote it, read into a pool name and a whole number of points.
+   *
+   * What the player said they were spending on THIS check, so one resolution both rolls the dice
+   * and pays for what changed them. Carried, never judged: whether the ruleset offers such a spend,
+   * whether the pool covers it and what it buys are all the resolver's business.
+   */
+  spend?: { pool: string; amount: number };
+  /**
+   * `use="Potence"` as the GM wrote it: the catalog entry the player is using ON this check.
+   *
+   * Carried, never judged. Whether the character actually has that entry, what it costs and what
+   * it does to the roll are all the resolver's business, and it needs the ruleset's catalogs to
+   * answer any of them.
+   */
+  useEntry?: string;
+  /** `apply="Name; Other"` as the GM wrote it (1.156): rows or entries that apply to this roll.
+   *  Carried, never judged; the resolver decides which apply and what they do. */
+  apply?: string[];
   /** `pool=` exactly as written, for the mismatch log. Present whenever `poolDeclared` is. */
   poolRaw?: string;
   /**
@@ -229,6 +300,53 @@ export function readGmTagAttributes(body: string): SkillCheckTagAttribute[] {
   return attributes;
 }
 
+const symbolId = z
+  .string()
+  .max(40)
+  .regex(/^[a-z][a-z0-9_]*$/);
+const symbolDetailsSchema = z
+  .object({
+    labels: z.record(symbolId, z.string().min(1).max(80)).refine((labels) => Object.keys(labels).length <= 10),
+    faces: z.array(z.array(symbolId).max(3)).max(36),
+    criticalSuccess: z.boolean(),
+    criticalFailure: z.boolean(),
+  })
+  .strict();
+
+/** Read only bounded symbol records; malformed metadata stays an unresolved request. */
+function readSymbolRecord(values: Map<string, string>) {
+  if (!values.has("symbols")) return undefined;
+  try {
+    const raw = values.get("symboldetails") ?? "";
+    if (raw.length > 20000) return undefined;
+    const details = symbolDetailsSchema.parse(JSON.parse(decodeURIComponent(raw)));
+    const entries = (values.get("symbols") ?? "").trim().split(/\s+/).filter(Boolean);
+    if (entries.length > 10) return undefined;
+    const symbols: Record<string, number> = Object.create(null);
+    for (const entry of entries) {
+      const match = /^(\d{1,3})([a-z][a-z0-9_]{0,39})$/.exec(entry);
+      if (!match || Number(match[1]) < 1 || Number(match[1]) > 216 || Object.hasOwn(symbols, match[2]!))
+        return undefined;
+      symbols[match[2]!] = Number(match[1]);
+    }
+    const thrown = (values.get("thrown") ?? "").split("|").filter(Boolean);
+    if (!z.array(symbolId).max(36).safeParse(thrown).success || thrown.length !== details.faces.length)
+      return undefined;
+    if ([...Object.keys(symbols), ...details.faces.flat()].some((id) => !Object.hasOwn(details.labels, id)))
+      return undefined;
+    return {
+      symbols: { ...symbols },
+      thrown,
+      symbolLabels: details.labels,
+      symbolFaces: details.faces,
+      criticalSuccess: details.criticalSuccess,
+      criticalFailure: details.criticalFailure,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Read one `[skill_check: ...]` tag body.
  *
@@ -276,9 +394,12 @@ export function parseSkillCheckTagBody(body: string): SkillCheckTag | null {
 
   const skill = values.get("skill")?.trim() ?? "";
   const dc = Number.parseInt(values.get("dc") ?? "", 10);
-  if (!skill || Number.isNaN(dc)) return null;
+  // A difficulty named by its ladder step stands in for `dc=`, which only a ruleset game can read.
+  // Cut at the schema's own label limit, so any step's label can be named.
+  const difficulty = values.get("difficulty")?.trim().slice(0, 80);
+  if (!skill || (Number.isNaN(dc) && !difficulty)) return null;
 
-  const tag: SkillCheckTag = { skill, dc };
+  const tag: SkillCheckTag = { skill, ...(Number.isNaN(dc) ? {} : { dc }), ...(difficulty ? { difficulty } : {}) };
   const modeValue = values.get("mode")?.trim().toLowerCase();
 
   // Advantage is a declaration, so it is read where declarations live: `mode=`,
@@ -320,6 +441,64 @@ export function parseSkillCheckTagBody(body: string): SkillCheckTag | null {
     const threshold = Number(values.get("threshold"));
     if (Number.isFinite(threshold)) tag.threshold = threshold;
   }
+  // A whole number of dice, or nothing. `Number` rather than `parseInt`, so "1.5" stays unusable
+  // instead of becoming 1, and the emptiness test comes first because `Number("")` is 0 and an
+  // attribute written with no value has declared nothing.
+  const bonusValue = values.get("bonus")?.trim();
+  if (bonusValue) {
+    const bonus = Number(bonusValue);
+    if (Number.isInteger(bonus)) tag.bonusDice = bonus;
+  }
+  for (const key of ["setback", "upgradeOwn"] as const) {
+    const value = values.get(key.toLowerCase())?.trim();
+    if (value && Number.isInteger(Number(value)) && Number(value) >= 0) tag[key] = Number(value);
+  }
+  const upgradeValue = values.get("upgrade")?.trim();
+  if (upgradeValue) {
+    const upgrades = Number(upgradeValue);
+    if (Number.isInteger(upgrades) && upgrades >= 0) tag.upgrades = upgrades;
+  }
+  const darkValue = values.get("dark")?.trim();
+  if (darkValue) {
+    const dark = Number(darkValue);
+    if (Number.isInteger(dark) && dark >= 0) tag.darkDice = dark;
+  }
+  const rerollName = values.get("reroll")?.trim();
+  if (rerollName) tag.reroll = rerollName.slice(0, 40);
+  if (values.get("reason")?.trim().toLowerCase() === "untrained") tag.reason = "untrained";
+  // A face, so a whole number or nothing, on the same terms as `bonus=`.
+  for (const key of ["explode", "double"] as const) {
+    const written = values.get(key)?.trim();
+    const face = written ? Number(written) : Number.NaN;
+    if (Number.isInteger(face)) tag[key] = face;
+  }
+  // `spend="<pool>:<points>"`. Read on the same terms as `threshold=` and `bonus=`: written at all,
+  // not necessarily usable. A body with no colon, an empty pool name or a number that is not a
+  // whole positive one has declared nothing the Engine could act on.
+  const spendValue = values.get("spend")?.trim();
+  if (spendValue) {
+    const at = spendValue.lastIndexOf(":");
+    const pool = at > 0 ? spendValue.slice(0, at).trim() : "";
+    const amount = at > 0 ? Number(spendValue.slice(at + 1).trim()) : Number.NaN;
+    if (pool && Number.isInteger(amount) && amount > 0) tag.spend = { pool: pool.slice(0, 100), amount };
+  }
+  const useEntry = values.get("use")?.trim();
+  // A catalog entry's label may be 120 characters, and this is the name that has to match one, so
+  // the cut is the schema's own limit rather than the 100 the rest of these use: a shorter one
+  // would make an entry with a long label impossible to name.
+  if (useEntry) tag.useEntry = useEntry.slice(0, 120);
+  // `apply="Name; Other"` (1.156): what the character has that applies to this one roll. Up to four
+  // names, each cut where an entry's label is.
+  const applied = (values.get("apply") ?? "")
+    .split(";")
+    .map((name) => name.trim().slice(0, 120))
+    .filter(Boolean)
+    .slice(0, 4);
+  if (applied.length) tag.apply = applied;
+  const who = values.get("who")?.trim();
+  if (who) tag.who = who.slice(0, 100);
+  const withAbility = values.get("with")?.trim();
+  if (withAbility) tag.withAbility = withAbility.slice(0, 100);
   if (values.has("pool")) {
     tag.poolDeclared = true;
     tag.poolRaw = values.get("pool")!;
@@ -327,13 +506,132 @@ export function parseSkillCheckTagBody(body: string): SkillCheckTag | null {
     if (poolSlots) tag.poolSlots = poolSlots;
   }
 
+  // A record always has the number it was rolled against, so a tag that names only a difficulty is
+  // read as an ask whatever else it carries.
+  const recordDc = tag.dc;
+
+  const penaltyValue = Number(values.get("penalty"));
+  const penalty = Number.isFinite(penaltyValue) && penaltyValue < 0 ? { penalty: penaltyValue } : {};
+  // Said by the Engine's own record only, and read back so a reloaded card still says it.
+  const complication = values.get("complication")?.trim().toLowerCase() === "true" ? { complication: true } : {};
+  const adjustValue = Number(values.get("adjust"));
+  const adjust = Number.isInteger(adjustValue) && adjustValue !== 0 ? { adjust: adjustValue } : {};
+  // The standing re-throw the record says was thrown, read back with the rest of what it applied.
+  const thrownAgain = tag.reroll ? { reroll: tag.reroll } : {};
+  // And what the character's conditions and items did, said by the Engine's own record only.
+  const effectsValue = Number(values.get("effects"));
+  const fromNames = (values.get("from") ?? "")
+    .split(";")
+    .map((name) => name.trim().slice(0, 120))
+    .filter(Boolean)
+    .slice(0, 24);
+  const automatic = values.get("automatic")?.trim().toLowerCase() === "true";
+  // The ruleset's outcome band (1.135), said by the Engine's own record and read back so a reloaded
+  // card still says it. Cut at the schema's label limit.
+  const outcomeLabel = values.get("outcome")?.trim().slice(0, 80);
+  // What the die's faces are worth (1.136), whole numbers only and no more than the schema allows.
+  const faceList = (values.get("faces") ?? "").split("|").map((entry) => entry.trim());
+  const faceValues =
+    faceList.length >= 2 && faceList.length <= 20 && faceList.every((entry) => /^-?\d+$/.test(entry))
+      ? faceList.map((entry) => Number.parseInt(entry, 10))
+      : undefined;
+  const unmodifiedFace = Number(values.get("unmodified"));
+  // A stance's direction and the dice that showed exactly the target (1.137).
+  const compareRaw = values.get("compare")?.trim().toLowerCase();
+  const compareValue: SkillCheckResult["compare"] =
+    compareRaw === "below" || compareRaw === "above" ? compareRaw : undefined;
+  const exactCount = Number(values.get("exact"));
+  const exactLabel = values.get("exactlabel")?.trim().slice(0, 40);
+  // A keep-the-highest check and its dark dice (1.138).
+  const highestCount = Number(values.get("highest"));
+  const zeroDice = values.get("zerodice")?.trim().toLowerCase() === "true";
+  const darkCount = Number(values.get("dark"));
+  const darkLabel = values.get("darklabel")?.trim().slice(0, 40);
+  const darkHighest = values.get("darkhighest")?.trim().toLowerCase() === "true";
+  // A roll read against the sheet's number, and its tens dice (1.139).
+  const againstRaw = values.get("against")?.trim().toLowerCase();
+  const againstValue: SkillCheckResult["against"] =
+    againstRaw === "at-most" || againstRaw === "at-least" ? againstRaw : undefined;
+  const tensCount = Number(values.get("tens"));
+  const symbolRecord = readSymbolRecord(values);
+  if (values.has("symbols") && !symbolRecord) return tag;
+  const effected = {
+    ...symbolRecord,
+    ...(symbolRecord && tag.setback ? { setback: tag.setback } : {}),
+    ...(symbolRecord && tag.upgradeOwn ? { upgradeOwn: tag.upgradeOwn } : {}),
+    ...(Number.isInteger(effectsValue) && effectsValue !== 0 ? { effects: effectsValue } : {}),
+    ...(fromNames.length > 0 ? { from: fromNames } : {}),
+    ...(automatic ? { automatic: true } : {}),
+    ...(outcomeLabel ? { outcome: outcomeLabel } : {}),
+    ...(faceValues ? { faces: faceValues } : {}),
+    ...(Number.isInteger(unmodifiedFace) && unmodifiedFace > 0 ? { unmodified: unmodifiedFace } : {}),
+    ...(compareValue ? { compare: compareValue } : {}),
+    ...(Number.isInteger(exactCount) && exactCount > 0
+      ? { exact: exactCount, ...(exactLabel ? { exactLabel } : {}) }
+      : {}),
+    ...(Number.isInteger(highestCount) && highestCount > 0 && highestCount <= 3
+      ? {
+          highest: highestCount,
+          ...(zeroDice ? { zeroDice: true } : {}),
+          ...(values.get("darkoutcome") === "light" ? { darkOutcome: "light" as const } : {}),
+        }
+      : {}),
+    ...(againstValue ? { against: againstValue } : {}),
+    ...(Number.isInteger(tensCount) && tensCount !== 0 && Math.abs(tensCount) <= 3 ? { tens: tensCount } : {}),
+    ...(Number.isInteger(darkCount) && darkCount > 0 && darkCount <= 10
+      ? { dark: darkCount, ...(darkLabel ? { darkLabel } : {}), ...(darkHighest ? { darkHighest: true } : {}) }
+      : {}),
+  };
   const rollsValue = values.get("rolls");
   const modifier = Number.parseInt(values.get("modifier") ?? "", 10);
   const total = Number.parseInt(values.get("total") ?? "", 10);
   const resultValue = values.get("result")?.trim().toLowerCase();
   const resolution: SkillCheckResult["resolution"] = declaredResolution === "successes" ? "successes" : "sum";
 
-  if (!rollsValue || Number.isNaN(modifier) || Number.isNaN(total) || !resultValue) {
+  // An EMPTY pool is a real result with no dice in it: a ruleset whose pool may be 0 fails the check
+  // without a roll and records `dice="0dN" rolls=""`. Read it back as the failure it was, so the
+  // record survives a reload instead of looking like a check nobody rolled. Nothing else may have
+  // an empty `rolls=`, and the shape is never Engine-rollable, so this cannot adopt a model's claim
+  // as a roll: it can only ever say "no dice, no successes". A save something made fail without a
+  // roll (`automatic="true"`) has the same shape on a summed check too.
+  const emptyPool =
+    recordDc !== undefined &&
+    values.has("rolls") &&
+    (rollsValue ?? "").trim() === "" &&
+    (resolution === "successes" || automatic || symbolRecord || (Number.isInteger(highestCount) && highestCount > 0)) &&
+    // The written strings, not the parsed numbers: `parseInt` reads "0 or so" as 0, and only the
+    // Engine's own exact record may be read back this way.
+    values.get("total")?.trim() === "0" &&
+    values.get("modifier")?.trim() === "0" &&
+    /^0d[1-9]\d{0,3}$/.test(declaredDice ?? "") &&
+    (resultValue === "failure" ||
+      resultValue === "critical_failure" ||
+      resultValue === "critical failure" ||
+      (!!symbolRecord && resultValue === "success"));
+  if (emptyPool && (!symbolRecord || symbolRecord.thrown.length === 0)) {
+    tag.resolvedResult = {
+      skill,
+      dc: recordDc!,
+      rolls: [],
+      usedRoll: 0,
+      modifier: 0,
+      total: 0,
+      success: !!symbolRecord && resultValue === "success",
+      criticalSuccess: false,
+      criticalFailure: resultValue !== "failure",
+      rollMode: "normal",
+      resolution,
+      dice: declaredDice,
+      ...penalty,
+      ...complication,
+      ...adjust,
+      ...thrownAgain,
+      ...effected,
+    };
+    return tag;
+  }
+
+  if (!rollsValue || Number.isNaN(modifier) || Number.isNaN(total) || !resultValue || recordDc === undefined) {
     // Sparse tag — the resolver will roll + apply modifier, unless the tag names
     // a system the engine does not roll. If the GM echoed a single integer in
     // rolls="...", treat it as a player-submitted d20 — but only on a tag the
@@ -359,7 +657,7 @@ export function parseSkillCheckTagBody(body: string): SkillCheckTag | null {
   const inferredRollFromTotal = total - modifier;
   const parsedRolls = parseSkillCheckRolls(rollsValue, inferredRollFromTotal);
   const rolls = parsedRolls.rolls;
-  if (rolls.length === 0) return tag;
+  if (rolls.length === 0 || (symbolRecord && symbolRecord.thrown.length !== rolls.length)) return tag;
 
   const usedRoll = Number.isFinite(explicitUsedRoll)
     ? explicitUsedRoll
@@ -417,18 +715,19 @@ export function parseSkillCheckTagBody(body: string): SkillCheckTag | null {
 
   const isPlainD20Check =
     resolution === "sum" && rolls.length === 1 && normalizedMode === "normal" && (implicitD20 || declaredD20);
-  if (isPlainD20Check) {
+  // A roll at most its target (1.139) succeeds the other way round, so the d20 audit is not its own.
+  if (isPlainD20Check && !againstValue && !symbolRecord) {
     const actualRoll = rolls[0]!;
     const rollIsD20 = actualRoll >= 1 && actualRoll <= 20;
     const usedRollHolds = usedRoll === actualRoll;
     const arithmeticHolds = actualRoll + modifier === total;
-    const outcomeHolds = criticalSuccess || criticalFailure || success === total >= dc;
+    const outcomeHolds = criticalSuccess || criticalFailure || success === total >= recordDc;
     if (!rollIsD20 || !usedRollHolds || !arithmeticHolds || !outcomeHolds) return tag;
   }
 
   tag.resolvedResult = {
     skill,
-    dc,
+    dc: recordDc,
     rolls,
     usedRoll,
     modifier,
@@ -439,6 +738,11 @@ export function parseSkillCheckTagBody(body: string): SkillCheckTag | null {
     rollMode: normalizedMode,
     resolution,
     dice,
+    ...penalty,
+    ...complication,
+    ...adjust,
+    ...thrownAgain,
+    ...effected,
   };
 
   return tag;

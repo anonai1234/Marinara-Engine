@@ -254,6 +254,11 @@ const reminderTags = new Set<string>();
 for (const file of [
   "packages/server/src/services/game/gm-prompts.ts",
   "packages/server/src/services/game/party-prompts.ts",
+  // The world's own blocks teach the Game Master its place, history and world tags (worldgen).
+  "packages/shared/src/features/world/game-world.ts",
+  "packages/shared/src/features/world/history.ts",
+  "packages/shared/src/features/world/ledger.ts",
+  "packages/shared/src/features/world/story.ts",
 ]) {
   for (const match of withoutComments(sourceOf(file), file).matchAll(/\[([A-Za-z_][A-Za-z0-9_]*)\s*:/g)) {
     reminderTags.add(match[1]!.toLowerCase());
@@ -261,7 +266,7 @@ for (const file of [
 }
 
 // Source B — every bracket name the Engine parses back out of a finished turn. There are five
-// parsers, not two: the client tag parser and the client narration formatter, the server's segment
+// parsers, not two: the shared tag parser and the client narration formatter, the server's segment
 // editor, the sidecar scene analyzer, and the generate route's dialogue rewriter. The dialogue
 // tokens are pinned from here rather than from the reminder, because the reminder renders them
 // inside an alternation (`[main|side|whisper:Target|thought]`) that a `[name:` sweep cannot see —
@@ -278,7 +283,7 @@ for (const file of [
 // names the five above already hold. Rot cover is not worth widening what the constant claims to be.
 const parserTags = new Set<string>();
 for (const file of [
-  "packages/client/src/lib/game-tag-parser.ts",
+  "packages/shared/src/utils/game-tag-parser.ts",
   "packages/client/src/components/game/game-narration-format.ts",
   "packages/server/src/services/game/segment-edits.ts",
   "packages/server/src/services/sidecar/scene-analyzer.ts",
@@ -291,7 +296,7 @@ assert.ok(reminderTags.size >= 15, `the GM reminder sweep found only ${reminderT
 assert.ok(parserTags.size >= 25, `the tag-parser sweep found only ${parserTags.size} tags; the extractor broke`);
 // Canaries no other source in the union can supply, so losing one proves a source dropped out:
 // `reputation` only ever appears in the GM reminder, `whisper` in colon form only in the party
-// reminder, the party pair only in the client tag parser, the QTE pair only in the client narration
+// reminder, the party pair only in the shared tag parser, the QTE pair only in the client narration
 // formatter, and `main`/`whisper` only inside a regex alternation, which is what the narrow sweep
 // this pin used to run could not read.
 // `element_attack` used to stand for the tag parser here and no longer can: the narration formatter
@@ -303,7 +308,7 @@ assert.ok(reminderTags.has("reputation"), "the reminder sweep must still see [re
 assert.ok(reminderTags.has("whisper"), "the party-prompts reminder must still be part of the sweep");
 assert.ok(
   parserTags.has("party-chat") && parserTags.has("party-turn"),
-  "the client tag parser must still be part of the sweep",
+  "the shared tag parser must still be part of the sweep",
 );
 assert.ok(
   parserTags.has("qte_bonus") && parserTags.has("qte_result"),
@@ -809,20 +814,30 @@ assert.deepEqual(
 // handed a variable or a helper's return value, in either write shape. Its keys cannot be read from
 // here at all, so the COUNT is pinned — another opaque call fails until someone reads it by hand
 // and either widens a walk above or adds the namespace to ENGINE_OWNED_METADATA_KEY_PREFIXES.
-// Nineteen are `patchMetadata`/`updateMetadata` calls; the other
+// Twenty are `patchMetadata`/`updateMetadata` calls; the other
 // two are route PATCHes, and neither is a live gap today — one is the mutation hook's own
 // implementation, whose keys the client-mutation arm reads at its call sites instead, and the other
 // is a debounced scene patch assembled into a variable whose four keys the literal beside it repeats
-// verbatim. The twenty-first call is st-chat.importer.ts passing `remappedMetadata`: it preserves
+// verbatim. The importer call is st-chat.importer.ts passing `remappedMetadata`: it preserves
 // existing metadata, remaps Advanced Memory knowledge/narrator settings and roster anchors, and
 // rewrites summary, summaryEntries, and lastAutomaticSummaryMessageId. `advancedMemory` is now reserved;
 // `summary` and `last` already were. This is an audited variable payload, not a newly ignored literal.
+// Scene conclude/abandon/convert now share one conditional release helper instead of three
+// variable-payload writes: two fewer opaque calls. The helper only clears activeSceneChatId and
+// sceneBusyCharIds, covered by the existing `active` and `scene` reserved namespaces.
+// Multiplayer adds two audited variable writes: game-runtime.ts commits only game* and
+// multiplayer* turn effects, while chats.storage.ts routes an existing full metadata update
+// through the guarded patch queue. The wrapper introduces no new keys. Both namespaces
+// are reserved; room generation also preserves the coordinator's multiplayer object.
+// Capability API 1.341 adds one audited variable write: capability-persistence.service.ts's
+// patchChatMetadata hands a package's own patch to the queued patchMetadata. It is the package's
+// write path, the same as updateChatMetadata beside it, so it introduces no Engine key.
 // The other half of the boundary — a read off a parameter inside a helper — has no count
 // to pin, which is why sub-source 7 exists rather than a seventh sweep. The docs state both limits.
 assert.equal(
   unreadableWriteCalls,
-  21,
-  `chat-metadata writes this sweep cannot read statically changed: expected 21, found ${unreadableWriteCalls}. ` +
+  22,
+  `chat-metadata writes this sweep cannot read statically changed: expected 22, found ${unreadableWriteCalls}. ` +
     "This count is a boundary marker, not a budget, so do not simply edit the number to match. Read the " +
     "call this added by hand — the sites are listed below — and decide what it writes: if it commits a key " +
     "under a namespace that is not already in ENGINE_OWNED_METADATA_KEY_PREFIXES, add that namespace (or " +

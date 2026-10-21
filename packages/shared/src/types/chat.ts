@@ -2,9 +2,15 @@
 // Chat & Message Types
 // ──────────────────────────────────────────────
 
-import type { MariWorkspaceTraceItem } from "./professor-mari-workspace.js";
+import type {
+  MariHeldChange,
+  MariWorkspaceActionResult,
+  MariWorkspaceTraceItem,
+  ProfessorMariAskContext,
+} from "./professor-mari-workspace.js";
 import type { GameDicePlaceholderRecord } from "../utils/dice-placeholder.js";
 import type { GenerationGuideSource } from "../utils/generation-guide.js";
+import type { ContextFitSummary, GenerationFallbackNotice } from "./generation-integration.js";
 import type { HapticFeedbackSensitivity } from "./haptic.js";
 import type { CustomEmojiSelectionPrefs } from "../schemas/custom-emoji.schema.js";
 import type { DiceRollResult, GameDicePoolConsumption, GameDicePoolMismatch } from "./game.js";
@@ -25,6 +31,11 @@ export type ChatMode = "conversation" | "roleplay" | "game";
 /** How a multi-character (group) chat is handled. */
 export type GroupChatMode = "merged" | "individual";
 
+/** The one reading of a stored group mode: anything but "individual" is the default Merged mode. */
+export function normalizeGroupChatMode(value: unknown): GroupChatMode {
+  return value === "individual" ? "individual" : "merged";
+}
+
 /** How individual-mode group chats decide response order. */
 export type GroupResponseOrder = "sequential" | "smart" | "manual";
 
@@ -35,6 +46,17 @@ export interface KnowledgeAgentSourceSettings {
   sourceLorebookIds?: string[];
   /** Uploaded file source IDs. Used by Knowledge Retrieval only. */
   sourceFileIds?: string[];
+}
+
+/**
+ * What a Conversation video message starts from: a fresh selfie, the character's avatar (or
+ * sprite), a selfie with the avatar as fallback, or nothing (text-to-video).
+ */
+export const VIDEO_FIRST_FRAMES = ["picture_or_avatar", "picture", "avatar", "prompt_only"] as const;
+export type VideoFirstFrame = (typeof VIDEO_FIRST_FRAMES)[number];
+
+export function normalizeVideoFirstFrame(value: unknown): VideoFirstFrame {
+  return VIDEO_FIRST_FRAMES.includes(value as VideoFirstFrame) ? (value as VideoFirstFrame) : "picture_or_avatar";
 }
 
 export const CONVERSATION_COMMAND_KEYS = [
@@ -176,6 +198,20 @@ export interface ChatSummaryPromptTemplate {
 /** Server app-setting key for Roleplay Chat Summary prompt templates shared across all roleplays. */
 export const CHAT_SUMMARY_PROMPT_SETTINGS_KEY = "chat-summary-prompts";
 
+const PROFESSOR_MARI_SEEN_RUN_SETTINGS_PREFIX = "professor-mari-seen-run:";
+
+/** Per Professor Mari thread: the id of the newest run the user has seen in her window. */
+export function professorMariSeenRunSettingsKey(chatId: string) {
+  return `${PROFESSOR_MARI_SEEN_RUN_SETTINGS_PREFIX}${chatId}`;
+}
+
+export function isProfessorMariSeenRunSettingsKey(key: string) {
+  return (
+    key.startsWith(PROFESSOR_MARI_SEEN_RUN_SETTINGS_PREFIX) &&
+    /^[A-Za-z0-9_-]{1,80}$/.test(key.slice(PROFESSOR_MARI_SEEN_RUN_SETTINGS_PREFIX.length))
+  );
+}
+
 /** Global Roleplay Chat Summary prompt template settings. */
 export interface ChatSummaryPromptSettings {
   templates: ChatSummaryPromptTemplate[];
@@ -254,6 +290,11 @@ export type GameStoryboardViewerDisplayMode = "floating" | "background";
 
 /** Extra metadata stored on a chat. */
 export interface ChatMetadata {
+  /** Fresh, explicitly reviewed setup for an optional shared session. */
+  multiplayerSetup?: boolean;
+  multiplayerSetupComplete?: boolean;
+  multiplayerGameSetup?: { preferences: string; gmConnectionId?: string; gameName?: string };
+  multiplayer?: import("./multiplayer.js").MultiplayerStoredRoom | import("./multiplayer.js").MultiplayerJoinedRoom;
   /** Opt-in coordinated Roleplay context and scene memory. */
   advancedMemory?: import("./advanced-memory.js").AdvancedMemorySettings;
   /** Durable maintenance checkpoint; model calls never hold a storage transaction. */
@@ -264,6 +305,14 @@ export interface ChatMetadata {
   };
   /** Roleplay presentation only; omitted chats use the Appearance default. */
   roleplayDisplayStyle?: "classic" | "visual-novel";
+  /**
+   * This chat's window layout on a computer (window places and sizes, pinned and locked state,
+   * popped-out drawers), owned and validated by the client. Absent migrates an older chat's toolbar;
+   * null selects the current defaults, including after Reset View.
+   */
+  windowLayout?: unknown;
+  /** Hide Chat Settings' introductory tips for this chat; included in settings profiles. */
+  chatSettingsHintDismissed?: boolean;
   /** Chat-local tracker icon overrides keyed by persona id, unique character id, or tracker character slot. */
   trackerStatIconOverrides?: Record<string, import("../constants/stat-icons.js").TrackerStatIconAssignment[]>;
   /** Compiled enabled rolling summary text for context injection. Derived from summaryEntries when present. */
@@ -286,6 +335,9 @@ export interface ChatMetadata {
   automaticSummaryEnabled?: boolean;
   /** Keep recent automatic summaries in context while retrieving relevant older Conversation weeks or Roleplay entries. */
   semanticSummaryRetrievalEnabled?: boolean;
+  semanticSummaryRecentCount?: number;
+  semanticSummaryOlderCount?: number;
+  semanticSummaryMinSimilarity?: number;
   /** Last assistant message ID processed by the automatic Roleplay summary updater. */
   lastAutomaticSummaryMessageId?: string | null;
   /** Chat-scoped manual summary prompt templates. Missing or empty uses the built-in default. */
@@ -315,7 +367,7 @@ export interface ChatMetadata {
   agentWriteApprovalRequired?: boolean;
   /** Per-agent enable overrides (agentId → boolean) */
   agentOverrides: Record<string, boolean>;
-  /** Agent IDs scoped to this chat. Non-empty = only these agents run; empty = use globally-enabled agents. */
+  /** Agent IDs that run in this chat. An empty list runs none. */
   activeAgentIds: string[];
   /** Per-chat selected named prompt template for each agent type. Missing/default = the agent's default prompt. */
   agentPromptTemplateIds?: Record<string, string>;
@@ -323,18 +375,32 @@ export interface ChatMetadata {
   illustratorIncludeCharacterAppearance?: boolean;
   /** Whether Illustrator should send matching character/persona avatar references to image providers. */
   illustratorUseAvatarReferences?: boolean;
+  /** Whether Roleplay video prompts get matched character appearance lines, like images with the setting above. */
+  illustratorVideoIncludeCharacterAppearance?: boolean;
   /** Optional per-chat LLM connection override used only to write Illustrator/selfie image prompts. */
   illustratorPromptConnectionId?: string | null;
   /** Optional per-chat image generation connection override used by Illustrator. */
   illustratorImageConnectionId?: string | null;
   /** Number of image variants generated for each Illustrator request. */
   illustratorImagesPerGeneration?: number;
+  /**
+   * Messages between automatic Illustrator runs in this chat: a whole number from 0 to 100, where 0 means
+   * it only runs when the user asks (Gallery or slash command). Missing/null = the agent's Run Interval.
+   */
+  illustratorRunInterval?: number | null;
   /** Whether Roleplay Illustrator may generate and activate a reusable background after a scene-location change. */
   illustratorAutoBackgroundsEnabled?: boolean;
   /** Whether Conversation selfie commands should send the matching character avatar as a reference image. */
   selfieUseAvatarReferences?: boolean;
   /** Whether Conversation selfie commands should append matched character card appearance text to image prompts. */
   selfieIncludeCharacterAppearance?: boolean;
+  /** Conversation video prompts get matched character appearance lines. */
+  selfieVideoIncludeCharacterAppearance?: boolean;
+  /**
+   * A Conversation video with no picture to start from (First frame: prompt only) sends the matched
+   * character's avatar or sprite as its reference image.
+   */
+  selfieVideoUseAvatarReferences?: boolean;
   /** Whether Game Mode scene illustrations should send matching character/persona avatar references. */
   gameImageUseAvatarReferences?: boolean;
   /** Whether Game Mode scene illustrations should append matched character-card appearance fields. */
@@ -389,6 +455,8 @@ export interface ChatMetadata {
   spriteCharacterIds?: string[];
   /** Which sprite file families the roleplay Expression Engine may display. */
   spriteDisplayModes?: Array<"expressions" | "full-body">;
+  /** Only show roleplay sprites returned by the latest completed Expression Engine result. Off by default. */
+  expressionOnlyActiveSprites?: boolean;
   /** Preferred sidebar / default layout side for chat sprites. */
   spritePosition?: SpriteSide;
   /**
@@ -446,6 +514,8 @@ export interface ChatMetadata {
   discordWebhookUrl?: string;
   /** When true, Noodle timeline refreshes may include this chat's recent messages as generation context. */
   noodleTimelineContextEnabled?: boolean;
+  /** When true, the Slurp package may add this chat's characters' recent Slurp activity to the prompt. Off unless set. */
+  slurp2ActivityContextEnabled?: boolean;
   /** Per-chat ephemeral / enabled overrides for lorebook entries (entryId → state).
    *  Tracked per-chat so ephemeral countdown in one chat doesn't affect others. */
   entryStateOverrides?: Record<string, { ephemeral?: number | null; enabled?: boolean }>;
@@ -488,7 +558,10 @@ export interface ChatMetadata {
   roleplayRollAudience?: RoleplayCommandAudience;
   roleplayCombatAudience?: RoleplayCommandAudience;
   roleplayDocumentAudience?: RoleplayCommandAudience;
+  roleplayWhisperAudience?: RoleplayCommandAudience;
   roleplaySoundConnectionId?: string | null;
+  /** Show each illustrate command's images inside the message, where the command was written. */
+  roleplayIllustrateInline?: boolean;
   /** Chat-scoped Intiface Central WebSocket URL for haptic manual and auto-connect. */
   hapticIntifaceUrl?: string | null;
   /** Haptic response style for any chat mode. Missing = standard. */
@@ -602,6 +675,9 @@ export interface ChatMetadata {
   gameCombatStyle?: import("./game.js").GameCombatStyle;
   /** Live tactical (grid) battle snapshot — restored on page refresh while a tactical fight is in progress. */
   gameTacticalCombatSnapshot?: import("../features/tactical-combat/types.js").TacticalCombatState | null;
+  /** The ruleset this game was created on, pinned for the game's lifetime. Absent means
+   *  `engine-legacy`: the Engine's own rules, exactly as before rulesets existed. */
+  gameRuleset?: import("../schemas/ruleset.schema.js").RulesetRef;
   /** User's initial game setup preferences */
   gameSetupConfig?: import("./game.js").GameSetupConfig | null;
   /** Immutable creation-time setup retained for viewing and sharing after the campaign changes. */
@@ -686,8 +762,10 @@ export interface ChatMetadata {
   gameStoryboardUseNovelAiCharacterPrompts?: boolean;
   /** Last generated scene-video record ID for this game. */
   gameLastSceneVideoId?: string | null;
-  /** Connection used for roleplay/gallery scene-video generation. */
+  /** Connection used for roleplay/gallery scene-video generation and Conversation video messages. */
   sceneVideoConnectionId?: string | null;
+  /** First frame of a Conversation video message; see `normalizeVideoFirstFrame`. */
+  sceneVideoFirstFrame?: VideoFirstFrame | null;
   /** Last generated roleplay/gallery scene-video record ID. */
   sceneLastVideoId?: string | null;
   /** Game-mode GM instruction override. Empty/null uses the built-in default prompt. */
@@ -788,6 +866,12 @@ export interface MessageAttachment {
   name?: string;
   prompt?: string;
   galleryId?: string;
+  /** Character who sent a Conversation selfie; older selfies lack it. */
+  characterName?: string;
+  /** For `type: "video"`: the generated scene video row this attachment plays. */
+  videoId?: string;
+  durationSeconds?: number;
+  aspectRatio?: string;
 }
 
 /** A reaction on a Conversation message: an emoji token + who reacted. */
@@ -818,6 +902,16 @@ export interface MessageReply {
   messageId: string;
   name: string;
   content: string;
+}
+
+/** A character's scene invitation, retained with the response that proposed it. */
+export interface ConversationSceneRequest {
+  prompt: string;
+  background?: string | null;
+  planHint?: string | null;
+  initiatorCharId?: string | null;
+  initiatorCharName?: string | null;
+  connectionId?: string | null;
 }
 
 /** Additional data attached to a message. */
@@ -860,6 +954,7 @@ export interface MessageExtra {
    * like [selfie] remain part of the model-visible transcript.
    */
   conversationCommandContent?: string | null;
+  sceneRequest?: ConversationSceneRequest | null;
   /** Private actions for this swipe, never replayed into shared prompt history. */
   roleplayPrivateCommands?: RoleplayPrivateCommand[] | null;
   /** Provider reasoning from a private turn must not be replayed into shared history. */
@@ -871,10 +966,31 @@ export interface MessageExtra {
   roleplayCommandActivity?: RoleplayCommandActivity[] | null;
   /** Professor Mari workspace trace shown on the home assistant transcript. */
   mariWorkspaceTimeline?: MariWorkspaceTraceItem[] | null;
+  /** Trusted resource results from Professor Mari workspace app-data commands. */
+  mariWorkspaceActionResults?: MariWorkspaceActionResult[] | null;
+  /** Resource focus used for this Professor Mari exchange, retained for transcript context. */
+  professorMariContext?: ProfessorMariAskContext | null;
   /** True when this Mari turn deferred mutating commands behind an Accept action (#5725 Manual mode). */
   mariDeferredMutations?: boolean | null;
+  /** Slice 71: what those held commands would change, for the "Needs you" card. */
+  mariHeldChanges?: MariHeldChange[] | null;
+  /** The raw held commands, so Accept can apply exactly them server-side (server-validated on read). */
+  mariHeldCalls?: unknown;
+  /** Slice 70: the quick-reply chips this Mari turn offered (raw; the client sanitizes), so a reload keeps them. */
+  mariSuggestions?: unknown;
+  /**
+   * R14: why this Mari turn failed, on the turn's last saved message (her partial reply, or your message
+   * when she saved nothing), so a reload still shows it failed. `dismissed` once you close its card.
+   */
+  mariRunError?: { message: string; dismissed?: boolean } | null;
   /** Per-swipe sprite expressions from the Expression Engine agent */
   spriteExpressions?: Record<string, string> | null;
+  /** Presentation-only ID-macro card references for merged Roleplay narrator avatars; never chat members. */
+  referencedCharacterIds?: string[];
+  /** All sprite owners in the completed expression result, including the persona. Empty means none. */
+  expressionSpriteIds?: string[];
+  /** An earlier Individual group reply: its `spriteExpressions` hold only its own character, not the whole turn. */
+  expressionTurnPart?: boolean;
   /** Per-swipe CYOA choices from the CYOA Choices agent */
   cyoaChoices?: Array<{ label: string; text: string }> | null;
   /** Presentation-only Game Mode cues retained so completed turns can be replayed without rerunning scene analysis. */
@@ -902,8 +1018,18 @@ export interface MessageExtra {
   hiddenFromUser?: boolean;
   /** When true, the visible message is excluded from future AI prompt context */
   hiddenFromAI?: boolean;
+  /** User bookmark shown in chat tools. Never sent to the model. */
+  bookmark?: import("../utils/message-marks.js").MessageBookmark | null;
+  /** Keep this message in prompt context when the message limit would otherwise drop it. */
+  pinnedToContext?: boolean;
+  /** User-only note attached to this message. Never sent to the model. */
+  privateNote?: string | null;
   /** Character IDs whose generation context excludes this message. Global hiddenFromAI takes precedence. */
   hiddenFromAICharacterIds?: string[];
+  /** Advanced Memory hid this message from these characters automatically; decided once per message. */
+  autoVisibility?: { decidedAt: string; hiddenCharacterIds: string[] } | null;
+  /** The user changed this message's character visibility, so automatic visibility never touches it. */
+  visibilityManual?: boolean;
   /** When true, Roleplay renders this generated assistant turn as a fresh bubble instead of grouping with the previous assistant turn. */
   startsNewAssistantBubble?: boolean;
   /** Structured dice roll payload rendered by the chat UI. */
@@ -991,6 +1117,8 @@ export interface GenerationInfo {
   temperature: number | null;
   tokensPrompt: number | null;
   tokensCompletion: number | null;
+  /** Input tokens in the latest completed model request, including cache but excluding output. */
+  tokensLastRequestInput?: number | null;
   /** Occupied tokens in the latest completed model request, including cache and output; null when unreported. */
   tokensContext?: number | null;
   /** Completed main-model requests in this turn; agent and separate Game planner calls are excluded. */
@@ -1008,6 +1136,10 @@ export interface GenerationInfo {
   /** Time from generation start until reasoning yielded to visible output. */
   reasoningDurationMs?: number | null;
   finishReason: string | null;
+  /** What the context fit cut from this prompt, for the "replies got worse" checkup. */
+  contextFit?: ContextFitSummary | null;
+  /** Set when the chosen connection failed and the fallback wrote this reply (#7697). */
+  fallback?: GenerationFallbackNotice | null;
 }
 
 /** A swipe (alternate response) for a message. */
@@ -1042,6 +1174,8 @@ export interface GenerateRequest {
   attachments?: MessageAttachment[];
   /** One-shot Narrative Director mode for this generation, if the user armed Push Story. */
   narrativeDirectorMode?: "natural" | "random" | null;
+  /** One-shot Smart speaker selection for an individual Roleplay group. */
+  smartResponse?: boolean;
 }
 
 /** An SSE event from the generation stream. */

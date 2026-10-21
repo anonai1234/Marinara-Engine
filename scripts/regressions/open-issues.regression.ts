@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -46,7 +46,12 @@ import {
   orderConversationRespondersByDelay,
   remainingConversationPresenceDelay,
 } from "../../packages/server/src/routes/generate/conversation-presence-runtime.js";
-import { AGENT_SUITE_TRACKER_SLICES } from "../../packages/client/src/lib/agent-suite-tracker-slices.js";
+import {
+  AGENT_SUITE_TRACKER_SLICES,
+  TRACKER_SLICE_ERROR_KEYS,
+  trackerSliceErrorMessage,
+  type TrackerSliceError,
+} from "../../packages/client/src/lib/agent-suite-tracker-slices.js";
 import type { GameState } from "../../packages/shared/src/types/game-state.js";
 
 const REPOSITORY_ROOT = fileURLToPath(new URL("../../", import.meta.url));
@@ -159,10 +164,7 @@ import {
   stripConversationPromptTimestamps,
   stripConversationResponseEnvelope,
 } from "../../packages/server/src/services/conversation/transcript-sanitize.js";
-import {
-  GAME_SETUP_GENERATION_TIMEOUT_MS,
-  resolveInitialGameGmConnectionId,
-} from "../../packages/server/src/services/game/initial-game-setup.js";
+import { resolveInitialGameGmConnectionId } from "../../packages/server/src/services/game/initial-game-setup.js";
 import {
   resolveIllustratorPromptRuntime,
   type IllustratorPromptConnection,
@@ -189,10 +191,7 @@ import {
 import { persistGeneratedImageToEntityGalleries } from "../../packages/server/src/services/image/generated-image-entity-gallery.js";
 import { withGalleryFileLifecycleLock } from "../../packages/server/src/services/image/gallery-file-lifecycle.js";
 import { runRetrySetupPhase } from "../../packages/server/src/routes/generate/retry-agents-route.js";
-import {
-  parseImageGenerationUserSettings,
-  resolveIllustratorImageSize,
-} from "../../packages/server/src/services/image/image-generation-settings.js";
+import { resolveIllustratorImageSize } from "../../packages/server/src/services/image/image-generation-settings.js";
 import { generateIllustratorImageVariants } from "../../packages/server/src/services/image/illustrator-image-variants.js";
 import { fetchBotBrowserJson } from "../../packages/server/src/services/bot-browser/fetch-json.js";
 import { isAllowedResponseContentType, validateOutboundUrl } from "../../packages/server/src/utils/security.js";
@@ -289,6 +288,7 @@ import {
   buildReferencedPersonaContext,
   extractPersonaReferenceIds,
   MAX_REFERENCED_CHARACTERS,
+  mergeGeneratedChatMacroVariables,
   normalizeChatMacroVariables,
   setLorebookEntryCounts,
 } from "../../packages/server/src/services/prompt/macro-context.js";
@@ -303,7 +303,10 @@ import {
   buildInitialAgentAddSetupState,
 } from "../../packages/client/src/components/chat/AgentAddSetupFields.js";
 import { resolveSpriteTransition } from "../../packages/client/src/lib/sprite-transition.js";
-import { resolveSpriteExpressionState } from "../../packages/client/src/lib/sprite-expression-state.js";
+import {
+  resolveLatestSpriteExpressionTurn,
+  resolveSpriteExpressionState,
+} from "../../packages/client/src/lib/sprite-expression-state.js";
 import {
   parseIllustratorPromptReviewOverride,
   resolveIllustratorPromptSubmission,
@@ -400,7 +403,6 @@ import {
   filterAndSortBackgrounds,
   getNextBackgroundFolderName,
 } from "../../packages/client/src/lib/background-library.js";
-import { resolveProfessorMariNavigation } from "../../packages/client/src/lib/professor-mari-navigation.js";
 import { resolveCapabilityPackageDisplay } from "../../packages/client/src/lib/capability-package-localization.js";
 import { resolveFeatureAgentPackage } from "../../packages/client/src/lib/feature-agent-package.js";
 import { mergeEmbeddedCharacterCardFields } from "../../packages/client/src/lib/character-import.js";
@@ -598,7 +600,7 @@ assert.equal(
 );
 assert.match(
   characterRoutesSource,
-  /const sprites = await readSpritesForId\(char\.id, true\);[\s\S]*if \(!sprites\)[\s\S]*status\(413\)[\s\S]*buildCompatibleCharacterExport\(charData, sprites\)/u,
+  /const sprites = await readSpritesForId\(char\.id, true\);[\s\S]*if \(!sprites\)[\s\S]*status\(413\)[\s\S]*buildCompatibleCharacterExport\(charData, sprites, \{ keepOnboarding: true \}\)/u,
   "PNG export must reject sprite collections that cannot round-trip before building the card envelope",
 );
 assert.match(
@@ -647,7 +649,7 @@ assert.match(
 );
 assert.match(
   importRoutesSource,
-  /app\.post\("\/marinara-package"[\s\S]*?for \(const entry of entries\)[\s\S]*?NATIVE_PACKAGE_ENTRY_LIMIT_BYTES[\s\S]*?totalUncompressedBytes > NATIVE_PACKAGE_UPLOAD_LIMIT_BYTES[\s\S]*?package contents are too large[\s\S]*?dataEntry\.getData\(\)/u,
+  /app\.post\("\/marinara-package"[\s\S]*?for \(const entry of entries\)[\s\S]*?NATIVE_PACKAGE_ENTRY_LIMIT_BYTES[\s\S]*?totalUncompressedBytes > NATIVE_PACKAGE_UPLOAD_LIMIT_BYTES[\s\S]*?package contents are too large[\s\S]*?dataEntry\.read\(NATIVE_PACKAGE_ENTRY_LIMIT_BYTES\)/u,
   "native package imports must validate ZIP entry sizes before extraction",
 );
 assert.match(
@@ -755,7 +757,7 @@ assert.match(
 );
 assert.match(
   professorMariWorkspaceSource,
-  /updates are patches[\s\S]{0,400}read the entity back[\s\S]{0,300}requested value[\s\S]{0,220}Claim completion only/u,
+  /updates are patches[\s\S]{0,400}read the entity back[\s\S]{0,300}Claim completion only when every requested value matches/u,
   "Professor Mari must preserve unrelated fields and verify requested character edits before claiming completion",
 );
 const professorMariSeedSource = readFileSync(join(REPOSITORY_ROOT, "packages/server/src/db/seed-mari.ts"), "utf8");
@@ -764,107 +766,6 @@ assert.match(
   /Keep card fields distinct:[\s\S]{0,600}fetch the character again/u,
   "The seeded Professor Mari command guide must retain the same targeted character-field safeguards",
 );
-
-assert.deepEqual(resolveProfessorMariNavigation("Where are the characters?"), {
-  kind: "panel",
-  panel: "characters",
-});
-assert.deepEqual(resolveProfessorMariNavigation("CHARS"), { kind: "panel", panel: "characters" });
-assert.deepEqual(resolveProfessorMariNavigation("Persona?"), { kind: "panel", panel: "personas" });
-for (const query of ["Chats", "conversations", "convo", "roleplay", "GAME"]) {
-  assert.deepEqual(resolveProfessorMariNavigation(query), { kind: "chats" });
-}
-assert.deepEqual(resolveProfessorMariNavigation("Can I talk to Professor Mari?"), { kind: "professor" });
-assert.deepEqual(resolveProfessorMariNavigation("Where do I disable Professor Mari navigation?"), {
-  kind: "settings",
-  tab: "general",
-  controlId: "professor-mari-navigation",
-});
-assert.deepEqual(resolveProfessorMariNavigation("change my theme"), { kind: "settings", tab: "appearance" });
-assert.deepEqual(resolveProfessorMariNavigation("image generation settings"), {
-  kind: "settings",
-  tab: "generations",
-});
-assert.deepEqual(resolveProfessorMariNavigation("open Discord"), { kind: "window", window: "discord" });
-assert.deepEqual(resolveProfessorMariNavigation("customize my home widgets"), {
-  kind: "window",
-  window: "widgets",
-});
-const professorMariNamedResources = [
-  { kind: "character" as const, id: "character-maukie", name: "Maukie" },
-  { kind: "persona" as const, id: "persona-echo", name: "Echo" },
-  { kind: "character" as const, id: "character-echo", name: "Echo" },
-  { kind: "preset" as const, id: "preset-cinema", name: "Cinematic RP" },
-  { kind: "lorebook" as const, id: "lorebook-snezhnaya", name: "Snezhnaya Archives" },
-  { kind: "agent" as const, id: "illustrator", name: "Illustrator", aliases: ["image agent"] },
-];
-assert.deepEqual(resolveProfessorMariNavigation("Maukie", [], professorMariNamedResources), {
-  kind: "resource",
-  resource: "character",
-  id: "character-maukie",
-});
-assert.deepEqual(resolveProfessorMariNavigation("Where is Maukie?", [], professorMariNamedResources), {
-  kind: "resource",
-  resource: "character",
-  id: "character-maukie",
-});
-assert.deepEqual(resolveProfessorMariNavigation("Mauk", [], professorMariNamedResources), {
-  kind: "resource",
-  resource: "character",
-  id: "character-maukie",
-});
-assert.deepEqual(resolveProfessorMariNavigation("edit the Echo persona", [], professorMariNamedResources), {
-  kind: "resource",
-  resource: "persona",
-  id: "persona-echo",
-});
-// An ambiguous name resolves to the first matching resource in supply order.
-assert.deepEqual(resolveProfessorMariNavigation("Echo", [], professorMariNamedResources), {
-  kind: "resource",
-  resource: "persona",
-  id: "persona-echo",
-});
-assert.deepEqual(resolveProfessorMariNavigation("open Cinematic RP preset", [], professorMariNamedResources), {
-  kind: "resource",
-  resource: "preset",
-  id: "preset-cinema",
-});
-assert.deepEqual(resolveProfessorMariNavigation("Snezhnaya Archives lorebook", [], professorMariNamedResources), {
-  kind: "resource",
-  resource: "lorebook",
-  id: "lorebook-snezhnaya",
-});
-assert.deepEqual(resolveProfessorMariNavigation("Illustrator", [], professorMariNamedResources), {
-  kind: "resource",
-  resource: "agent",
-  id: "illustrator",
-});
-assert.deepEqual(
-  resolveProfessorMariNavigation("Where did Noodle go?", [
-    { id: "official.noodle", label: "Noodle", aliases: ["NoodleR"] },
-  ]),
-  { kind: "package", packageId: "official.noodle" },
-);
-assert.equal(resolveProfessorMariNavigation("Where did Noodle go?"), null);
-assert.equal(resolveProfessorMariNavigation("quantum spaghetti cupboard"), null);
-assert.deepEqual(
-  resolveProfessorMariNavigation(
-    "Midnight at Zapolyarny",
-    [],
-    [],
-    [{ id: "chat-midnight", name: "Midnight at Zapolyarny" }],
-  ),
-  { kind: "chat", chatId: "chat-midnight" },
-);
-assert.deepEqual(resolveProfessorMariNavigation("CHAT", [], [], [{ id: "chat-generic", name: "Chat" }]), {
-  kind: "chats",
-});
-for (const name of ["Conversation", "Roleplay", "Game"]) {
-  assert.deepEqual(resolveProfessorMariNavigation(name, [], [], [{ id: `chat-${name}`, name }]), {
-    kind: "chat",
-    chatId: `chat-${name}`,
-  });
-}
 
 const localizedPackageManifest = {
   name: "Noodle",
@@ -1036,7 +937,7 @@ assert.throws(
 assert.deepEqual(HOME_CHAT_MODE_ACCENTS, {
   conversation: "oklch(0.79 0.16 205)",
   roleplay: "oklch(0.76 0.19 52)",
-  game: "var(--marinara-chat-chrome-accent)",
+  game: "var(--marinara-mode-game-accent)",
 });
 
 const backgroundOrganization = normalizeBackgroundLibraryOrganization({
@@ -1096,6 +997,54 @@ assert.deepEqual(
   { "character-a": "neutral" },
 );
 assert.deepEqual(findMissingComfyReferenceSlots(comfyReferenceWorkflow, "reference_image", 1), [1]);
+const completedExpressionMessages = [
+  { id: "completed", role: "assistant", extra: { expressionSpriteIds: ["character-a", "persona"] } },
+  { id: "user", role: "user", extra: {} },
+  { id: "pending", role: "assistant", extra: {} },
+];
+assert.deepEqual(resolveLatestSpriteExpressionTurn(completedExpressionMessages), {
+  characterIds: ["character-a", "persona"],
+  messageId: "completed",
+  messageIndex: 0,
+});
+assert.deepEqual(
+  resolveLatestSpriteExpressionTurn([
+    ...completedExpressionMessages,
+    {
+      id: "empty",
+      role: "assistant",
+      extra: JSON.stringify({ expressionSpriteIds: [], spriteExpressions: { "character-a": "happy" } }),
+    },
+  ]),
+  { characterIds: [], messageId: "empty", messageIndex: 3 },
+  "a completed empty result is distinct from a pending or failed expression turn",
+);
+assert.deepEqual(
+  resolveLatestSpriteExpressionTurn([
+    { id: "legacy-persona", role: "user", extra: { spriteExpressions: { persona: "happy" } } },
+    { id: "legacy", role: "assistant", extra: { spriteExpressions: { "character-b": "neutral" } } },
+  ]),
+  { characterIds: ["character-b", "persona"], messageId: "legacy", messageIndex: 1 },
+  "legacy expression turns retain both character and persona owners",
+);
+assert.equal(resolveLatestSpriteExpressionTurn([{ id: "pending", role: "assistant", extra: {} }]), undefined);
+assert.deepEqual(
+  resolveLatestSpriteExpressionTurn([
+    completedExpressionMessages[0]!,
+    { id: "user", role: "user", extra: { spriteExpressions: { persona: "happy" } } },
+    { id: "regenerating", role: "assistant", extra: {} },
+  ]),
+  { characterIds: ["character-a", "persona"], messageId: "completed", messageIndex: 0 },
+  "a retained persona appearance alone does not prove the pending assistant's expressions completed",
+);
+assert.deepEqual(
+  resolveLatestSpriteExpressionTurn([
+    { id: "persona-only", role: "assistant", extra: { expressionSpriteIds: ["persona"] } },
+  ]),
+  { characterIds: ["persona"], messageId: "persona-only", messageIndex: 0 },
+  "the completion marker identifies persona-only turns without relying on retained user appearances",
+);
+assert.equal(resolveLatestSpriteExpressionTurn(undefined), undefined);
 assert.deepEqual(findMissingComfyReferenceSlots(comfyReferenceWorkflow, "reference_image_name", 1), [2]);
 assert.equal(numberedComfyReferencePlaceholder("reference_image_name", 2), "%reference_image_name_03%");
 
@@ -2438,7 +2387,7 @@ try {
     lorebookId: professorMariLorebookId,
   });
   assert.equal(
-    (professorMariEntryIndex.output as Array<{ content: string }>)[0]?.content.endsWith("…"),
+    (professorMariEntryIndex.output as { items: Array<{ content: string }> }).items[0]?.content.endsWith("…"),
     true,
     "the lorebook entry index should remain compact",
   );
@@ -4722,7 +4671,6 @@ assert.equal(
   "roleplay-images",
 );
 assert.equal(resolveIllustratorImageConnectionId("game", {}, " agent-images "), "agent-images");
-assert.equal(GAME_SETUP_GENERATION_TIMEOUT_MS, 500_000);
 const previousGameDynamicImagePromptTimeout = process.env.GAME_DYNAMIC_IMAGE_PROMPT_TIMEOUT_MS;
 try {
   delete process.env.GAME_DYNAMIC_IMAGE_PROMPT_TIMEOUT_MS;
@@ -5176,6 +5124,16 @@ assert.equal(
   "per-character safety limits should still be able to lower a numeric chat ceiling",
 );
 const autonomousChatId = "regression-autonomous-candidates";
+assert.equal(
+  dailyCapForCharacter(autonomousSchedule(90, 1000)),
+  1000,
+  "custom character limits are not capped at eight",
+);
+assert.equal(
+  dailyCapForCharacter(autonomousSchedule(90, 1000), { autonomousDailyCapOverride: 75 }),
+  75,
+  "the chat-wide safety cap still limits a larger custom character cap",
+);
 initializeActivityFromMessages(autonomousChatId, [
   { role: "user", createdAt: new Date(Date.now() - 5 * 60_000).toISOString() },
 ]);
@@ -5283,16 +5241,29 @@ assert.match(
   /has_explicit_node_heap_limit\(\)[\s\S]*NODE_OPTIONS_VALUE[\s\S]*const heapOption = \/\^--max[\s\S]*resolve_default_node_heap_mb\(\)[\s\S]*heap_mb=1024[\s\S]*heap_mb=1536[\s\S]*if ! has_explicit_node_heap_limit; then[\s\S]*--max-old-space-size=\$\{MARINARA_TERMUX_HEAP_MB\}/u,
   "Termux must parse complete heap-option tokens before applying its bounded profile-aware default",
 );
-for (const buildEntry of [
-  "packages/shared/dist/constants/defaults.js",
-  "packages/server/dist/index.js",
-  "packages/client/dist/index.html",
-]) {
+for (const buildEntry of ["packages/shared/dist/constants/defaults.js", "packages/server/dist/index.js"]) {
   assert.ok(
     termuxLauncher.includes(`if [ ! -f "${buildEntry}" ]; then`),
     `Termux must rebuild when ${buildEntry} is missing`,
   );
 }
+const termuxClientBuildBlock = termuxLauncher
+  .split("if ! node scripts/check-client-build.mjs; then\n")[1]
+  ?.split("\nfi")[0];
+assert.ok(termuxClientBuildBlock, "Termux must handle an incomplete client build");
+assert.equal(
+  termuxClientBuildBlock.match(/build_termux_client/gu)?.length,
+  2,
+  "Initial build and retry must use the bounded build heap",
+);
+const termuxClientBuildHelper = termuxLauncher.split("build_termux_client() (")[1]?.split("\n)")[0];
+assert.ok(termuxClientBuildHelper, "Termux must define the isolated client build helper");
+assert.match(termuxClientBuildHelper, /MARINARA_LOW_MEMORY_BUILD=1 run_pnpm --filter @marinara-engine\/client build/u);
+assert.match(
+  termuxClientBuildBlock,
+  /    node scripts\/check-client-build\.mjs$/u,
+  "Termux must rebuild and recheck incomplete client assets, including a missing index",
+);
 
 const trafficExtensionId = "open-issues-extension-traffic";
 const trafficNow = 180_000;
@@ -5428,6 +5399,17 @@ const professorMariHomeSource = readFileSync(
   new URL("../../packages/client/src/components/chat/HomeProfessorMariChat.tsx", import.meta.url),
   "utf8",
 );
+// Slice 82: the chat's parts live in components/chat/mari/; "nowhere" and count checks read all of them.
+const mariChatDir = new URL("../../packages/client/src/components/chat/mari/", import.meta.url);
+const mariChatPart = (name: string) => readFileSync(new URL(name, mariChatDir), "utf8");
+const mariChatAllSource = [professorMariHomeSource, ...readdirSync(mariChatDir).map(mariChatPart)].join("\n");
+const mariSeesPanelSource = mariChatPart("MariSeesPanel.tsx");
+const mariMessageActionsSource = mariChatPart("use-mari-message-actions.ts");
+const mariWorkspaceRunSource = mariChatPart("use-mari-workspace-run.ts");
+const mariChatHistoryActionsSource = mariChatPart("use-mari-chat-history-actions.ts");
+const mariWorkTimelineSource = mariChatPart("MariWorkTimeline.tsx");
+const mariTranscriptSource = mariChatPart("MariTranscript.tsx");
+const compactMariMessageSource = mariChatPart("CompactMariMessage.tsx");
 const contextBudgetChatInputSource = readFileSync(
   new URL("../../packages/client/src/components/chat/ChatInput.tsx", import.meta.url),
   "utf8",
@@ -5629,15 +5611,12 @@ for (const [name, source] of [
   assert.match(source, /<ContextBudgetIndicator budget=\{contextBudget\}/u, `${name} must show usage in its popup`);
   assert.match(source, /relative flex h-\[1\.875rem\] w-\[1\.875rem\]/u, `${name} must use the larger context gauge`);
 }
-assert.equal(
-  professorMariHomeSource.match(/<ContextBudgetIndicator budget=\{contextBudget\} \/>/gu)?.length,
-  2,
-  "Both Professor Mari connection popups must show context usage",
-);
-assert.equal(
-  professorMariHomeSource.match(/relative flex h-\[1\.875rem\] w-\[1\.875rem\]/gu)?.length,
-  2,
-  "Both Professor Mari connection buttons must use the larger context gauge",
+// Mari's context use moved out of the connection popups (69be7be17: it duplicated the status strip) into the
+// "how she works" connection row, behind the Show context usage setting.
+assert.match(
+  mariSeesPanelSource,
+  /showContextUsage && contextBudget\s*\?\s*localizeUi\("ui\.chat\.homeprofessormarichat\.awareOfContextUse"/u,
+  "Professor Mari's connection row must show context usage when the setting is on",
 );
 assert.match(professorMariHomeSource, /chatHistorySelectionMode/u);
 assert.match(
@@ -5645,24 +5624,32 @@ assert.match(
   /enterToSendProfessorMari/u,
   "Professor Mari must read her persisted Send on Enter preference",
 );
+// One composer since the floating-mode branch was removed (f27ce165b).
 assert.equal(
-  professorMariHomeSource.match(
+  mariChatAllSource.match(
     /event\.key === "Enter" &&\s*!event\.shiftKey &&\s*\(enterToSend \|\| event\.metaKey \|\| event\.ctrlKey\)/gu,
   )?.length,
-  2,
-  "Both Professor Mari composers must preserve Shift+Enter and require the configured send shortcut",
+  1,
+  "Professor Mari's composer must preserve Shift+Enter and require the configured send shortcut",
 );
 assert.match(professorMariHomeSource, /toggleProfessorChatSelection/u);
 assert.match(professorMariHomeSource, /handleBulkDeleteProfessorChats/u);
 assert.match(
-  professorMariHomeSource,
+  mariMessageActionsSource,
   /const handleEditMessage = useCallback\([\s\S]{0,180}if \(!chatId \|\| isBusy\) return;/u,
   "Professor Mari's first edit after generation must not be rejected by a stale busy ref",
 );
+// A failed send now keeps the message in the transcript with one Retry card (failRun) and never refills the
+// composer; Stop is not a failure, so failRun returns before it shows anything.
 assert.match(
-  professorMariHomeSource,
-  /catch \(error\) \{\s*if \(isProfessorMariAbortError\(error\)\) return;\s*setDraft\(text\)/u,
-  "Stopping Professor Mari must not restore an already-submitted prompt to the composer",
+  mariWorkspaceRunSource,
+  /const failRun = useCallback\(\s*\([^)]*\) => \{\s*if \(isProfessorMariAbortError\(error\)\) return;/u,
+  "Stopping Professor Mari must not show a failure",
+);
+assert.doesNotMatch(
+  mariChatAllSource,
+  /catch \(error\) \{[^}]*setDraft\(/u,
+  "A failed or stopped Professor Mari send must not restore the submitted prompt to the composer",
 );
 assert.match(
   lorebookHooksSource,
@@ -5670,13 +5657,15 @@ assert.match(
   "Deleting a lorebook must refresh cached chat metadata so it leaves active context immediately",
 );
 assert.match(
-  professorMariHomeSource,
+  mariChatHistoryActionsSource,
   /handleDeleteProfessorChat[\s\S]{0,500}showConfirmDialog/u,
   "Deleting one Professor Mari chat must use the app confirmation dialog",
 );
+// Every step row, failed ones included, opens to technical details with the tool's output (slice 72
+// moved the details into one `technicalDetails` helper that every step row renders).
 assert.match(
-  professorMariHomeSource,
-  /isError && tool\.output\?\.trim\(\)[\s\S]{0,200}<pre/u,
+  mariWorkTimelineSource,
+  /const technicalDetails = \(tool: WorkspaceToolCall\) =>[\s\S]{0,600}tool\.output !== null && tool\.output !== undefined \? <pre>/u,
   "Failed workspace tools must reveal their provider output in the transcript",
 );
 const professorMariTranscript = { clientHeight: 240, scrollHeight: 720, scrollTop: 0 };
@@ -5694,7 +5683,7 @@ assert.equal(
   "Professor Mari streaming must stop following output after the reader scrolls away from the bottom",
 );
 assert.match(
-  professorMariHomeSource,
+  mariTranscriptSource,
   /ref=\{setTranscriptScrollNode\}[\s\S]{0,100}data-component="HomeProfessorMariChat\.Transcript"/u,
   "Professor Mari transcript panes must trigger scrolling from their mounted ref",
 );
@@ -5705,11 +5694,11 @@ assert.match(
 );
 assert.match(
   professorMariHomeSource,
-  /options\.shouldApply\?\.\(\) === false[\s\S]{0,160}setMessages/u,
+  /options\.shouldApply\?\.\(\) === false[\s\S]{0,480}setMessages/u,
   "Professor Mari message loads must recheck an operation guard before applying a response",
 );
 assert.match(
-  professorMariHomeSource,
+  mariWorkspaceRunSource,
   /loadMessages\(completedChatId, \{[\s\S]{0,160}workspaceRunIdRef\.current === runId[\s\S]{0,100}activeChatIdRef\.current === completedChatId/u,
   "Professor Mari background refreshes must not overwrite state after a newer operation starts",
 );
@@ -5721,17 +5710,23 @@ assert.match(
   "Professor Mari workspace status loads must recheck an operation guard before applying a response",
 );
 assert.match(
-  professorMariHomeSource,
+  mariWorkspaceRunSource,
   /refreshWorkspaceStatus\([\s\S]{0,140}workspaceRunIdRef\.current === runId[\s\S]{0,100}activeChatIdRef\.current === completedChatId/u,
   "Professor Mari post-run status refreshes must not overwrite state after a newer operation starts",
 );
+// The work-stage layout (1a61247d1) replaced the user-message separators with a right-aligned bubble.
 assert.match(
-  professorMariHomeSource,
-  /message\.role === "user"[\s\S]{0,180}<TranscriptRow[\s\S]{0,100}border-y border-\[var\(--border\)\]\/60/u,
-  "Professor Mari user messages must retain their theme-aware horizontal separators",
+  compactMariMessageSource,
+  /message\.role === "user"[\s\S]{0,180}<TranscriptRow[^>]*className="mari-user-request/u,
+  "Professor Mari user messages must render as the user-request row",
 );
 assert.match(
-  professorMariHomeSource,
+  readFileSync(new URL("../../packages/client/src/styles/mari.css", import.meta.url), "utf8"),
+  /\.mari-user-request__bubble \{[^}]*background: color-mix\(in srgb, var\(--foreground\) \d+%, var\(--card\)\)/u,
+  "Professor Mari user bubbles must take their colour from the theme",
+);
+assert.match(
+  mariChatHistoryActionsSource,
   /Promise\.allSettled\([\s\S]*?api\.delete\(`\/chats\/internal\/professor-mari\/chats\/\$\{id\}`\)/u,
   "Professor Mari chat history should delete all selected chats through the existing endpoint",
 );
@@ -5799,10 +5794,20 @@ assert.equal(
   3,
   "Roleplay must identify both HUD layouts and package-provided agent surfaces",
 );
-assert.equal(
-  echoChamberPanelSource.match(/data-roleplay-agent-window="echo"/gu)?.length,
-  2,
-  "Collapsed and expanded Echo Chamber windows must share the mobile edit marker",
+assert.match(
+  echoChamberPanelSource,
+  /const rootAttributes = \{[^}]*"data-roleplay-agent-window": "echo"[^}]*\}/u,
+  "Echo Chamber should retain its marker for mobile composer visibility",
+);
+assert.match(
+  echoChamberPanelSource,
+  /<FloatingWindow[\s\S]*?rootAttributes=\{rootAttributes\}/u,
+  "the Echo Chamber window and desktop bubble must share the mobile edit marker",
+);
+assert.match(
+  echoChamberPanelSource,
+  /<WindowBubble[\s\S]*?attributes=\{\{ \.\.\.rootAttributes,/u,
+  "the collapsed phone Echo Chamber button must retain the mobile edit marker",
 );
 assert.match(chatRowPeekSource, /mari-chrome-accent-text-muted mari-accent-animated text-\[0\.6875rem\]/u);
 assert.match(assignedSweepChatAreaSource, /mari-chrome-accent-text-muted mari-accent-animated max-w-sm text-xs/u);
@@ -5853,25 +5858,12 @@ assert.match(
   /CHAT_SUMMARY_OPEN_REQUEST_EVENT[\s\S]{0,240}detail:\s*\{\s*chatId\s*\}/u,
   "Summary requests must carry the target chat ID",
 );
+// Chat Summary is a Chat Settings drawer, so a request opens Chat Settings there (desktop window or phone sheet).
 assert.match(
-  roleplaySurfaceSource,
-  /requestedChatId !== chatId/u,
-  "SummaryButton must filter requests by chat and only open visible instances",
-);
-assert.match(
-  roleplaySurfaceSource,
-  /rect\.width <= 0 \|\| rect\.height <= 0[\s\S]{0,180}setOpen\(true\)/u,
-  "SummaryButton must only open a measurable visible instance",
-);
-assert.match(
-  chatToolbarControlsSource,
-  /pendingSummaryChatIdRef\.current = chatId[\s\S]{0,80}setOpen\(true\)/u,
-  "Compact and mobile Summary requests must queue the target chat and open the overflow menu",
-);
-assert.match(
-  chatToolbarControlsSource,
-  /if \(!open \|\| !chatId\) return;[\s\S]{0,140}requestAnimationFrame\(\(\) => requestChatSummaryOpen\(chatId\)\)/u,
-  "Compact and mobile Summary requests must forward only after the overflow menu mounts",
+  assignedSweepChatAreaSource,
+  // One listener table now serves the summary, lorebook-entries and search drawers (omnibar chat tool rows).
+  /\[CHAT_SUMMARY_OPEN_REQUEST_EVENT, "summary"\][\s\S]{0,400}chatId !== useChatStore\.getState\(\)\.activeChatId\) return;\s*handleOpenSettingsPanel\(undefined, \{ initialSection \}\)/u,
+  "Summary requests must open Chat Settings at the Chat Summary drawer for the active chat only",
 );
 assert.match(
   narratorUiStoreSource,
@@ -5918,8 +5910,9 @@ assert.equal(
   1,
   "The dedicated Roleplay Inventory Tracker widget must suppress mount animations with reduced ambient effects",
 );
+// Clear Trackers is shared by every Agent activity section (Chat Settings, Trackers window, Tracker Panel).
 assert.match(
-  roleplayHudSource,
+  readFileSync(new URL("../../packages/client/src/hooks/use-agent-activity.ts", import.meta.url), "utf8"),
   /latestAssistantMessage[\s\S]{0,240}extra: \{ cyoaChoices: \[\] \}/u,
   "clearing Roleplay tracker state must also clear the persisted active CYOA prompt",
 );
@@ -6009,7 +6002,8 @@ assert.match(
 );
 assert.match(
   conversationGroupSettingsSource,
-  /if \(!\(await flushProseGuardianDrafts\(\)\)\) return false;[\s\S]{0,250}onClose\(\)[\s\S]{0,100}return true/u,
+  // The close button also closes a pinned window, hence `onClose({ force: true })` (#7036).
+  /if \(!\(await flushProseGuardianDrafts\(\)\)\) return false;[\s\S]{0,250}onClose\((?:\{ force: true \})?\)[\s\S]{0,100}return true/u,
   "Closing Chat Settings must persist changed Prose Guardian preferences before unmounting the drawer",
 );
 assert.match(
@@ -6086,7 +6080,7 @@ assert.match(
 );
 assert.match(
   conversationGenerationSource,
-  /await waitForConversationPresenceDelay\(remainingDelayMs, abortController\.signal\);\s*if \(abortController\.signal\.aborted\) break;\s*\}\s*if \(responderDelay\) \{\s*const refreshedMessages = await chats\.listMessages/u,
+  /await waitForConversationPresenceDelay\(remainingDelayMs, generationSignal\);\s*if \(generationSignal\.aborted\) break;\s*\}\s*if \(responderDelay\) \{\s*const refreshedMessages = await chats\.listMessages/u,
   "delayed Conversation responders should refresh user history even when an earlier reply consumed their wait",
 );
 assert.match(
@@ -6120,7 +6114,7 @@ assert.match(
   "Individual Conversation lorebook injection should happen separately for each provider generation",
 );
 assert.match(
-  conversationGenerationSource,
+  readFileSync(new URL("../../packages/server/src/routes/generate/reply-text-cleanup.ts", import.meta.url), "utf8"),
   /chatMode === "conversation" && otherNames\.length > 0[\s\S]{0,500}fullResponse = fullResponse\.slice\(0, nextSpeakerMatch\.index\)/u,
   "Individual Conversation generations should discard an extra character turn returned in the same completion",
 );
@@ -6150,7 +6144,12 @@ assert.match(
   /resolveIllustratorImageSize\(\s*requestChatMode === "game" \? imageSettings\.game : imageSettings\.illustration,\s*illData\.aspectRatio/u,
   "automatic Illustrator generation should use the Game scene canvas in Game mode and preserve the shared orientation resolver",
 );
-assert.match(professorMariHomeSource, /Math\.min\(textarea\.scrollHeight, 128\)/u);
+// R11: the composer cap is its CSS max-height now (8 lines, 6 on touch), not a hard-coded 128 px.
+assert.match(
+  professorMariHomeSource,
+  /const cap = Number\.parseFloat\(getComputedStyle\(textarea\)\.maxHeight\);\s*const to = Number\.isFinite\(cap\) \? Math\.min\(textarea\.scrollHeight, cap\)/u,
+  "Professor Mari's composer must stop growing at its max-height",
+);
 assert.equal(
   themesRouteSource.match(/requirePrivilegedAccess\(req, reply, \{ feature: "Theme install\/update\/delete" \}\)/gu)
     ?.length,
@@ -6186,6 +6185,20 @@ assert.notEqual(
   mobilePlaywrightProject.use?.baseURL,
   "desktop and mobile Playwright projects must use isolated app servers",
 );
+// Chromium runs with its audio output off, so opening an audio device cannot stall a headless page
+// (and the toasts with it); the switch is Chromium's own, so a WebKit project never gets it.
+for (const project of [desktopPlaywrightProject, mobilePlaywrightProject]) {
+  assert.ok(project.use?.launchOptions?.args?.includes("--disable-audio-output"), `${project.name} mutes Chromium`);
+}
+for (const project of playwrightConfig.projects ?? []) {
+  if (!/chromium/u.test(project.name ?? "")) assert.ok(!project.use?.launchOptions?.args?.length, project.name);
+}
+// WebKit on Linux opens its audio device through GStreamer on the page's main thread (the first tap's audio
+// unlock), and a hung audio stack froze that tap. The config ranks the fake audio sink first for every browser.
+assert.ok(
+  process.env.GST_PLUGIN_FEATURE_RANK?.split(",").includes("fakeaudiosink:MAX"),
+  "WebKit e2e browsers play to GStreamer's fake audio sink",
+);
 const playwrightServerSource = readFileSync(join(REPOSITORY_ROOT, "e2e/start-servers.mjs"), "utf8");
 assert.match(playwrightServerSource, /startProject\("mobile", mobileClientPort, mobileServerPort\)/u);
 assert.match(playwrightServerSource, /startProject\("desktop", desktopClientPort, desktopServerPort\)/u);
@@ -6208,8 +6221,13 @@ const globalStylesSource = readFileSync(
 );
 assert.match(
   globalStylesSource,
-  /@media \(max-width: 767px\)[\s\S]*\[data-component="ChatArea\.Roleplay"\]:has\(\.mari-roleplay-message-body--editing\) \[data-roleplay-agent-window\] \{\s*display: none;/u,
+  /@media \(max-width: 767px\)[\s\S]*\[data-component="ChatArea\.Roleplay"\]:has\(\.mari-roleplay-message-body--editing\)\s+\[data-roleplay-agent-window\]:not\(\[data-roleplay-agent-window="echo"\]\) \{\s*display: none;/u,
   "Mobile Roleplay editing must temporarily remove agent windows from the constrained viewport",
+);
+assert.match(
+  globalStylesSource,
+  /@media \(max-width: 767px\)[\s\S]*\[data-component="ChatArea\.Roleplay"\]\[data-mobile-composer-active="true"\] \[data-roleplay-agent-window="echo"\],\s*\[data-component="ChatArea\.Roleplay"\]:has\(\.mari-roleplay-message-body--editing\) \[data-roleplay-agent-window="echo"\] \{\s*visibility: hidden;/u,
+  "Mobile Echo must keep its scroll box while hidden, or reactions revealed during typing leave it pinned to a stale offset",
 );
 assert.equal(
   appSource.match(/document\.addEventListener\("visibilitychange", syncEffectsPausedState\)/gu)?.length,
@@ -6217,10 +6235,10 @@ assert.equal(
   "Home effect pausing must keep one central visibility listener",
 );
 assert.match(appSource, /dispatchEvent\(new CustomEvent\("marinara:effects-paused"/u);
-assert.match(homeBrowserHubSource, /window\.removeEventListener\(MARINARA_EFFECTS_PAUSED_EVENT, sync\)/u);
+// Slice 85: the navigator is gone; the Home widget's blink is the Mari frame that pauses with the page.
 assert.match(
   globalStylesSource,
-  /data-marinara-effects-paused="true"[^}]+mari-home-professor-popup__sprite[\s\S]+animation-play-state: paused !important;/u,
+  /data-marinara-effects-paused="true"\] \.mari-home-professor-blink,[^}]+animation-play-state: paused !important;/u,
 );
 const agentEditorSource = readFileSync(
   new URL("../../packages/client/src/components/agents/AgentEditor.tsx", import.meta.url),
@@ -6289,10 +6307,13 @@ const gameJournalSource = readFileSync(
   new URL("../../packages/client/src/components/game/GameJournal.tsx", import.meta.url),
   "utf8",
 );
-const choiceSelectionModalSource = readFileSync(
-  new URL("../../packages/client/src/components/presets/ChoiceSelectionModal.tsx", import.meta.url),
-  "utf8",
-);
+// The modal renders each variable's options through the shared ChoiceOptionsField.
+const choiceSelectionModalSource =
+  readFileSync(
+    new URL("../../packages/client/src/components/presets/ChoiceSelectionModal.tsx", import.meta.url),
+    "utf8",
+  ) +
+  readFileSync(new URL("../../packages/client/src/components/presets/ChoiceOptionsField.tsx", import.meta.url), "utf8");
 const gameSurfaceSource = readFileSync(
   new URL("../../packages/client/src/components/game/GameSurface.tsx", import.meta.url),
   "utf8",
@@ -6322,7 +6343,8 @@ assert.match(
 );
 assert.match(
   chatSettingsDrawerSource,
-  /flex w-full min-w-0 flex-col items-stretch gap-1\.5 sm:w-auto sm:shrink-0 sm:flex-row/u,
+  // Chat Settings content follows the window's width (container queries) since #7036.
+  /flex w-full min-w-0 flex-col items-stretch gap-1\.5 @lg:w-auto @lg:shrink-0 @lg:flex-row/u,
   "Lorebook Keeper actions must stack inside their mobile settings card",
 );
 const characterGreetingsSource = readFileSync(
@@ -6467,10 +6489,14 @@ const illustratorReferencesSource = readFileSync(
   "utf8",
 );
 assert.match(appSource, /--marinara-app-accent-static-gradient/u);
-assert.match(appSource, /position=\{notificationPosition === "bottom" \? "bottom-center" : "top-center"\}/u);
+// While the omnibar is open, toasts move to the edge it does not cover; otherwise the user's position applies.
 assert.match(
   appSource,
-  /swipeDirections=\{\["left", "right", notificationPosition === "bottom" \? "bottom" : "top"\]\}/u,
+  /position=\{\s*omnibarOpen\s*\?[^:]+:[^:]+:\s*notificationPosition === "bottom"\s*\? "bottom-center"\s*: "top-center"\s*\}/u,
+);
+assert.match(
+  appSource,
+  /swipeDirections=\{\[\s*"left",\s*"right",\s*omnibarOpen \? \(isMobileShell \? "top" : "bottom"\) : notificationPosition === "bottom" \? "bottom" : "top",\s*\]\}/u,
 );
 assert.doesNotMatch(agentEditorSource, /fetch\(["']\/api\/game-assets\/pick-local-music-folder/u);
 assert.match(agentEditorSource, /api\.post<[^>]+>\(["']\/game-assets\/pick-local-music-folder["']\)/u);
@@ -6674,7 +6700,38 @@ assert.doesNotMatch(
   /inline-flex h-4 w-7 shrink-0 items-center rounded-full/u,
   "Preset choices must not restore the undersized Android toggle",
 );
-assert.match(gameSurfaceSource, /h-\[min\(42rem,calc\(100dvh-6rem\)\)\]/u);
+// #3624: the Session window embeds the Game Journal, whose tabs scroll only inside a bounded height. The old
+// popover's fixed height cap moved to the control windows: a computer's window has a set height, and a phone's
+// sheet for content that scrolls itself is pinned top and bottom.
+const chatControlWindowSource = readFileSync(
+  new URL("../../packages/client/src/components/chat/ChatControlWindow.tsx", import.meta.url),
+  "utf8",
+);
+const floatingWindowSource = readFileSync(
+  new URL("../../packages/client/src/components/ui/FloatingWindow.tsx", import.meta.url),
+  "utf8",
+);
+assert.match(
+  gameSurfaceSource,
+  /id=\{CHAT_CONTROL_WINDOW_IDS\.session\}[\s\S]{0,400}scroll=\{false\}[\s\S]{0,200}\{renderSessionPanel\(\)\}/u,
+  "The Session window must leave scrolling to the Game Journal inside it",
+);
+assert.match(
+  gameSurfaceSource,
+  /const renderSessionPanel = \(\) => \{[\s\S]{0,300}<div className="flex min-h-0 flex-1 flex-col overflow-hidden">/u,
+  "The Session panel must fill its window as a bounded flex column",
+);
+assert.match(floatingWindowSource, /height: geometry\.height/u, "A computer's control window must have a set height");
+assert.match(
+  chatControlWindowSource,
+  /sheetClassName=\{cn\(PHONE_SHEET_CLASS, !scroll && PHONE_FULL_SHEET_CLASS\)\}/u,
+  "A phone sheet whose content scrolls itself must get a bounded height",
+);
+assert.match(
+  floatingWindowSource,
+  /export const PHONE_SHEET_CLASS =\s*"fixed[^"]*top-\[[^"]*max-h-\[[^"]*";\s*export const PHONE_FULL_SHEET_CLASS =\s*"bottom-\[/u,
+  "Phone sheets must stay on screen, and the full-height one must pin its bottom",
+);
 assert.match(gameSetupWizardSource, /ui\.game\.gamesetupwizard\.adjustGameAssetsForThisGame/u);
 assert.match(gameSetupWizardSource, /selectFoldersByDefault/u);
 assert.match(gameSetupWizardSource, /enableAgents: enableAgents \|\| undefined/u);
@@ -6861,10 +6918,10 @@ assert.equal(
 );
 assert.match(
   transcriptWindowControlsSource,
-  /const TRANSCRIPT_WINDOW_BUTTON_CLASS = "mari-chrome-control mari-chrome-control--small px-3 text-xs";/u,
+  /export const HISTORY_PAGER_BUTTON_CLASS =\s*"mari-chat-history-pager mari-chat-style-control mari-chrome-control mari-chrome-control--small px-3 text-xs";/u,
 );
 assert.equal(
-  transcriptWindowControlsSource.match(/className=\{cn\(TRANSCRIPT_WINDOW_BUTTON_CLASS, buttonClassName\)\}/gu)?.length,
+  transcriptWindowControlsSource.match(/className=\{cn\(HISTORY_PAGER_BUTTON_CLASS, buttonClassName\)\}/gu)?.length,
   3,
 );
 assert.doesNotMatch(transcriptWindowControlsSource, /text-\[var\(--muted-foreground\)\]/u);
@@ -6889,7 +6946,7 @@ assert.match(
 );
 assert.match(
   conversationSelfieRuntimeSource,
-  /selfieResolvedCharacterIds = Array\.from\([\s\S]{0,300}referenceResolution\.characterIds[\s\S]{0,4500}characterIds: selfieResolvedCharacterIds/u,
+  /selfieResolvedCharacterIds = Array\.from\([\s\S]{0,300}referenceResolution\.characterIds[\s\S]{0,5000}characterIds: selfieResolvedCharacterIds/u,
   "Conversation group selfies must be saved to every depicted character gallery",
 );
 assert.match(
@@ -6906,7 +6963,10 @@ const markdownBlockquoteStyles =
   globalStyles.match(/\.mari-message-content \.mari-md-blockquote \{[\s\S]*?\}/u)?.[0] ?? "";
 assert.match(markdownBlockquoteStyles, /color:\s*inherit;/u);
 assert.doesNotMatch(markdownBlockquoteStyles, /color:\s*var\(--muted-foreground\);/u);
-const markdownMessageStyles = globalStyles.match(/\.mari-message-content \{[\s\S]*?\}/u)?.[0] ?? "";
+// The workspace transcript adds its own earlier `.mari-message-content` rule (padding only); check every rule.
+const markdownMessageStyles = [...globalStyles.matchAll(/^\.mari-message-content \{[\s\S]*?\}/gmu)]
+  .map((match) => match[0])
+  .join("\n");
 const markdownMessageContainerStyles =
   globalStyles.match(/\.mari-message-body,\s*\.mari-message-bubble \{[\s\S]*?\}/u)?.[0] ?? "";
 const markdownCodeBlockStyles =
@@ -8644,7 +8704,7 @@ assert.match(
   "Only Conversation chats should create character membership timeline notices",
 );
 const summaryPopoverSource = readFileSync(
-  join(REPOSITORY_ROOT, "packages/client/src/components/chat/SummaryPopover.tsx"),
+  join(REPOSITORY_ROOT, "packages/client/src/components/chat/ChatSummaryPanel.tsx"),
   "utf8",
 );
 assert.match(
@@ -8880,8 +8940,8 @@ assert.doesNotMatch(
 );
 assert.match(
   summaryPopoverSource,
-  /if \(await commitCombinePromptDraft\(\)\) onClose\(\);/u,
-  "The Summary popover must close only after its Combine draft is safely persisted",
+  /batchAbortControllerRef\.current\?\.abort\(\);\s*void commitCombinePromptDraftRef\.current\(\);/u,
+  "Collapsing the Chat Summary drawer or closing Chat Settings must still persist the Combine draft",
 );
 assert.equal(
   summaryPopoverSource.match(/className="h-48 space-y-[12] overflow-y-auto pr-0\.5"/gu)?.length,
@@ -9202,6 +9262,20 @@ assert.equal(
   128,
   "The Tracker should use the matching right chat gutter",
 );
+assert.equal(
+  resolveTrackerPanelDesktopWidth({
+    preferredWidth: 340,
+    mainLeft: 0,
+    mainRight: 1024,
+    chatColumnLeft: 19,
+    chatColumnRight: 1005,
+    side: "right",
+    gap: 8,
+    minWidth: 96,
+  }),
+  96,
+  "A docked Tracker in a gutter too narrow for it keeps its minimum width instead of a sliver (#7188)",
+);
 assert.equal(resolveTrackerPanelContentScale(340, 340), 1);
 assert.equal(resolveTrackerPanelContentScale(340, 255), 0.75);
 assert.equal(
@@ -9211,7 +9285,7 @@ assert.equal(
 );
 assert.match(
   appShellSource,
-  /handleTrackerPanelWindowClosed[\s\S]{0,500}trackerPanelWindowTargetRef\.current\?\.popup !== closedTarget\.popup[\s\S]{0,300}setTrackerPanelOpen\(false, activeChatId\)/u,
+  /handleTrackerPanelWindowClosed[\s\S]{0,500}trackerPanelWindowTargetRef\.current\?\.popup !== closedTarget\.popup[\s\S]{0,300}closeTrackerPanel\(\)/u,
   "Closing a detached Tracker window must close the Tracker instead of silently docking it",
 );
 const backgroundSeedRoot = mkdtempSync(join(tmpdir(), "marinara-default-background-"));
@@ -9970,7 +10044,7 @@ assert.equal(({} as { tags?: string[] }).tags, undefined, "Background metadata m
   const worldMapsFeatureSummary = String(lorebookEnglishLocale["ui.chat.chatsettingsdrawer.worldMapsFeatureSummary"]);
   assert.equal(
     worldMapsFeatureSummary,
-    "Adds persistent hierarchical locations, durable shared worlds, reusable artwork, customizable Direct Link lines, and movement to Roleplay and Game.",
+    "Adds world maps to Roleplay and Game, from whole regions down to single rooms, with art and travel between places.",
     "The canonical English World Maps settings summary must describe the feature",
   );
   assert.doesNotMatch(
@@ -10307,7 +10381,7 @@ assert.equal(({} as { tags?: string[] }).tags, undefined, "Background metadata m
     "Persona inventory edits must preserve skills, status, and other player stats",
   );
   assert.deepEqual(AGENT_SUITE_TRACKER_SLICES["world-state"]!.buildPatch(gameState, { worldCustomFields: "invalid" }), {
-    error: "World custom fields must be a JSON array",
+    error: { code: "notArray", field: "worldCustomFields" },
   });
   assert.deepEqual(
     AGENT_SUITE_TRACKER_SLICES["persona-stats"]!.buildPatch(gameState, { personaStats: [] }),
@@ -10323,25 +10397,73 @@ assert.equal(({} as { tags?: string[] }).tags, undefined, "Background metadata m
     currencies: [],
     equipped: [],
     inventory: [{ foo: 1 }],
-  }) as { error?: string };
-  assert.match(
-    String(malformedRows.error),
-    /inventory/iu,
+  });
+  assert.deepEqual(
+    malformedRows,
+    { error: { code: "invalidInventoryRow", group: "inventory", problem: { code: "missingName", index: 0 } } },
     "a row without a name must be reported, naming the group it came from",
   );
-  assert.match(
-    String(
-      (
-        inventorySlice.buildPatch(gameState, {
-          currencies: [],
-          equipped: [],
-          inventory: [{ name: "Rope", qty: 0 }],
-        }) as { error?: string }
-      ).error,
-    ),
-    /qty/iu,
+  assert.deepEqual(
+    inventorySlice.buildPatch(gameState, {
+      currencies: [],
+      equipped: [],
+      inventory: [{ name: "Rope", qty: 0 }],
+    }),
+    { error: { code: "invalidInventoryRow", group: "inventory", problem: { code: "qtyBelowOne", index: 0 } } },
     "a quantity below 1 must be reported rather than silently clamped",
   );
+
+  // #7738: slice errors are codes the UI localizes. Every code must name an English key, and the
+  // English text must read as it did before the errors were localized.
+  const collectKeys = (value: unknown): string[] =>
+    typeof value === "string" ? [value] : Object.values(value as object).flatMap(collectKeys);
+  const trackerErrorKeys = collectKeys(TRACKER_SLICE_ERROR_KEYS);
+  assert.equal(trackerErrorKeys.length, 17, "every tracker slice error code has a key");
+  for (const key of trackerErrorKeys) {
+    assert.equal(typeof englishLocale[key], "string", `${key} must exist in en.json`);
+  }
+  const renderEnglish = (error: TrackerSliceError) =>
+    trackerSliceErrorMessage(error, (key, values) =>
+      englishLocale[key]!.replace(/\{\{(\w+)\}\}/gu, (_, name: string) => {
+        const value = (values as Record<string, unknown> | undefined)?.[name];
+        assert.ok(value !== undefined, `${key} needs {{${name}}}`);
+        return String(value);
+      }),
+    );
+  const sliceError = (slice: string, parsed: unknown) =>
+    (AGENT_SUITE_TRACKER_SLICES[slice]!.buildPatch(gameState, parsed) as { error: TrackerSliceError }).error;
+  const inventoryRows = (inventory: unknown[]) =>
+    sliceError("inventory-tracker", { currencies: [], equipped: [], inventory });
+  for (const [error, english] of [
+    [sliceError("world-state", []), "Scene data must be a JSON object"],
+    [sliceError("world-state", { worldCustomFields: "invalid" }), "World custom fields must be a JSON array"],
+    [sliceError("character-tracker", {}), "Present characters must be a JSON array"],
+    [sliceError("persona-stats", []), "Persona stats data must be a JSON object"],
+    [sliceError("persona-stats", { personaStats: {} }), "Persona stats must be a JSON array"],
+    [sliceError("persona-stats", { inventory: {} }), "Inventory must be a JSON array"],
+    [sliceError("custom-tracker", {}), "Custom tracker fields must be a JSON array"],
+    [sliceError("inventory-tracker", null), "Inventory Tracker data must be a JSON object"],
+    [
+      sliceError("inventory-tracker", { currencies: [] }),
+      "Inventory Tracker data must include currencies, equipped, and inventory arrays",
+    ],
+    [
+      { code: "invalidInventoryRow", group: "currencies", problem: { code: "notArray" } },
+      'Inventory Tracker "currencies": must be an array',
+    ],
+    [inventoryRows(["Rope"]), 'Inventory Tracker "inventory": row 0 must be an object'],
+    [inventoryRows([{ foo: 1 }]), 'Inventory Tracker "inventory": row 0 is missing a string "name"'],
+    [inventoryRows([{ name: "Rope" }, { name: "  " }]), 'Inventory Tracker "inventory": row 1 has an empty "name"'],
+    [
+      inventoryRows([{ name: "Rope", location: 3 }]),
+      'Inventory Tracker "inventory": row 0 has a non-string "location"',
+    ],
+    [inventoryRows([{ name: "Rope", qty: "lots" }]), 'Inventory Tracker "inventory": row 0 has a non-numeric "qty"'],
+    [inventoryRows([{ name: "Rope", qty: 0 }]), 'Inventory Tracker "inventory": row 0 has a "qty" below 1'],
+    [sliceError("quest", {}), "Active quests must be a JSON array"],
+  ] as const) {
+    assert.equal(renderEnglish(error), english);
+  }
 
   // Accepted payloads still get the shared invariants applied.
   const equippedWins = inventorySlice.buildPatch(gameState, {
@@ -10387,10 +10509,14 @@ assert.equal(({} as { tags?: string[] }).tags, undefined, "Background metadata m
 
   assert.match(
     chatAreaSource,
-    /<ChatConversationSurface[\s\S]*?onIllustrateWithAgent=\{async \(agentType\)[\s\S]*?forceImageGeneration: true/u,
+    /const handleIllustrateWithAgent = useCallback\([\s\S]*?forceImageGeneration: true[\s\S]*?<ChatConversationSurface[\s\S]*?onIllustrateWithAgent=\{handleIllustrateWithAgent\}/u,
     "Conversation Gallery must forward custom image-agent illustration requests",
   );
-  assert.match(conversationSurfaceSource, /onIllustrateWithAgent=\{onIllustrateWithAgent\}/u);
+  // The Gallery drawer in Chat Settings reads the actions the conversation surface provides.
+  assert.match(
+    conversationSurfaceSource,
+    /onIllustrateWithAgent,[\s\S]*?useProvideChatGalleryActions\(activeChatId, galleryActions\)/u,
+  );
 
   assert.match(settingsDrawerSource, /useGenerationStatus\(\s*chat\.id,\s*open && isRoleplayMode/u);
   const generationStatusHookSource = readFileSync(
@@ -10435,12 +10561,12 @@ assert.equal(({} as { tags?: string[] }).tags, undefined, "Background metadata m
   assert.match(turnGameResumeBlock, /await runTurnGameBotTurns\(/u);
   assert.match(
     turnGameResumeBlock,
-    /if \(abortController\.signal\.aborted \|\| isAbortLikeError\(turnGameErr\)\) return;/u,
+    /if \(generationSignal\.aborted \|\| isAbortLikeError\(turnGameErr\)\) return;/u,
     "Turn-game recovery must propagate cancellation without logging it as a failure",
   );
   assert.match(
     turnGameResumeBlock,
-    /await runTurnGameBotTurns\([\s\S]*?if \(abortController\.signal\.aborted\) return;/u,
+    /await runTurnGameBotTurns\([\s\S]*?if \(generationSignal\.aborted\) return;/u,
     "Turn-game recovery must re-check cancellation after a bot runner resolves",
   );
   assert.match(turnGameResumeBlock, /logger\.warn\(turnGameErr/u);
@@ -10644,10 +10770,19 @@ assert.equal(({} as { tags?: string[] }).tags, undefined, "Background metadata m
     500,
     "persisted chat-local macro variables remain capped",
   );
+  const fullMacroVariables = Object.fromEntries(Array.from({ length: 500 }, (_, i) => [`v${i}`, "x"]));
+  assert.deepEqual(
+    mergeGeneratedChatMacroVariables(fullMacroVariables, fullMacroVariables, {
+      ...fullMacroVariables,
+      overflow: "generated",
+    }),
+    fullMacroVariables,
+    "generation writes reapply the macro-variable cap after merging request changes",
+  );
   assert.match(
     generateRouteSource,
-    /macroVariables: normalizeChatMacroVariables\(\{[\s\S]{0,200}normalizeChatMacroVariables\(current\.macroVariables\)[\s\S]{0,120}requestChanges/u,
-    "generation writes reapply the macro-variable cap after merging request changes",
+    /macroVariables: mergeGeneratedChatMacroVariables\(\s*current\.macroVariables,\s*persistedMacroVariableSnapshot,\s*chatMacroVariables,/u,
+    "generation persists macro variables through the bounded merge helper",
   );
 
   const perfDiagnosticsSource = readFileSync(

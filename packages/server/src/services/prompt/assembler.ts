@@ -9,12 +9,14 @@ export { resolveChoiceVariableValue, type ChoiceOptionValue } from "@marinara-en
 import type { DB } from "../../db/connection.js";
 import { logger } from "../../lib/logger.js";
 import type {
+  CharacterMacroProfile,
   ChatMLMessage,
   MarkerConfig,
   WrapFormat,
   GenerationParameters,
   LorebookEntryTimingState,
   MacroContext,
+  MacroDecisionAnswers,
   ResolveMacroOptions,
 } from "@marinara-engine/shared";
 import { DEFAULT_GENERATION_PARAMS, generationParametersSchema, resolveMacros } from "@marinara-engine/shared";
@@ -32,7 +34,7 @@ import {
   type AdvancedMemoryPlacement,
   type AdvancedMemoryPromptParts,
 } from "./advanced-memory-prompt.js";
-import type { LorebookScanResult } from "../lorebook/index.js";
+import type { LorebookDecisionResolver, LorebookScanResult } from "../lorebook/index.js";
 import {
   buildReferencedCharacterContext,
   buildReferencedPersonaContext,
@@ -40,6 +42,7 @@ import {
   collectCharacterAdvancedPromptEntries,
   MAX_REFERENCED_CHARACTERS,
   MAX_REFERENCED_PERSONAS,
+  resolveChatSummaryMacros,
   resolveMacrosForPreview,
   resolveMacrosWithVariableSnapshot,
   setLorebookEntryCounts,
@@ -59,6 +62,8 @@ interface RuntimeAgentData {
 export interface AssemblerInput {
   /** Resolved model for this request, including connection overrides. */
   model?: string;
+  /** Reasoning level for {{reasoning}}: `low` to `max`, or `off`. */
+  reasoning?: string;
   /** Generation routes format messages after audience filtering and context fitting. */
   deferMessagePostProcessing?: boolean;
   db: DB;
@@ -89,6 +94,8 @@ export interface AssemblerInput {
     injectionDepth: number;
     injectionOrder: number;
     forbidOverrides: string;
+    /** "true" sends a prompt block without the preset wrapper; ignored for markers; missing means wrapped */
+    skipWrap?: string;
   }>;
   /** All groups for this preset */
   groups: Array<{
@@ -144,6 +151,8 @@ export interface AssemblerInput {
   lorebookScanMessages?: ChatMLMessage[];
   /** Current chat summary text (if any) */
   chatSummary?: string | null;
+  /** Characters a merged group reply may voice; the Chat Summary marks who knows what (#7252). */
+  chatSummaryReaders?: readonly CharacterMacroProfile[];
   /** Presence enables advanced memory placement; values must already be audience-scoped. */
   advancedMemory?: AdvancedMemoryPromptParts;
   /** Leave opaque slots for per-responder finalization without repeating lorebook/macro side effects. */
@@ -165,7 +174,7 @@ export interface AssemblerInput {
   /** Pre-computed embedding of chat context for semantic lorebook matching. */
   chatEmbedding?: number[] | null;
   /** Per-lorebook pre-computed embeddings for semantic lorebook matching. */
-  semanticEmbeddingsByLorebookId?: ReadonlyMap<string, number[] | null>;
+  semanticEmbeddingsByLorebookId?: ReadonlyMap<string, number[] | number[][] | null>;
   /** Provider/model/profile identity used to create semantic query vectors. */
   semanticEmbeddingSpaceId?: string | null;
   /** Unrelated-text cosine floor used to calibrate clustered embedding models. */
@@ -198,6 +207,10 @@ export interface AssemblerInput {
   preserveImpersonatePresetSections?: boolean;
   /** Preserve character-scoped macros for a later known-speaker finalization pass. */
   deferCharacterMacros?: boolean;
+  /** This turn's answers for `decision:` and `decision_choice:` conditions (#6569). */
+  decisions?: MacroDecisionAnswers;
+  /** Answers lorebook entries' decision statements for activation (#6570). */
+  lorebookDecisions?: LorebookDecisionResolver;
 }
 
 /** Output of the assembler. */
@@ -210,6 +223,8 @@ export interface AssemblerOutput {
   macroVariables: Record<string, string>;
   /** Agent outputs made available to {{agent::TYPE}} while assembling sections. */
   macroAgentData: Record<string, string>;
+  /** Valid character cards discovered through exact ID macros, including activated lorebook entries. */
+  referencedCharacterIds: string[];
   /** Any lorebook depth entries that were queued (already injected into messages) */
   lorebookDepthEntriesCount: number;
   /** Updated per-chat entry state overrides after ephemeral processing. Caller should persist to chat metadata. */
@@ -315,6 +330,7 @@ export async function assemblePrompt(input: AssemblerInput): Promise<AssemblerOu
   const macroCtx = await buildPromptMacroContext({
     db: input.db,
     model: input.model,
+    reasoning: input.reasoning,
     characterIds: input.characterIds,
     groupCharacterIds: input.groupCharacterIds,
     personaName: input.personaName,
@@ -335,6 +351,9 @@ export async function assemblePrompt(input: AssemblerInput): Promise<AssemblerOu
       ...input.chatMessages.map((message) => message.content),
     ],
   });
+  // Answered before assembly by the route; every context derived from this one,
+  // including each character's in a group block, carries them.
+  if (input.decisions) macroCtx.decisions = input.decisions;
   const personaReferenceSources = Object.values(input.personaFields ?? {}).filter(
     (value): value is string => typeof value === "string",
   );
@@ -390,12 +409,15 @@ export async function assemblePrompt(input: AssemblerInput): Promise<AssemblerOu
 
   const addActivatedLorebookCardReferences = async (result: LorebookScanResult) => {
     let discoveredReferences = false;
+    const activeCharacterIds = input.groupCharacterIds ?? input.characterIds;
     const existingReferenceIds = Object.keys(macroCtx.characterReferences ?? {});
-    const remainingReferenceSlots = Math.max(0, MAX_REFERENCED_CHARACTERS - existingReferenceIds.length);
+    // Names of characters already in the chat take no slot: their cards are not added again.
+    const pulledReferenceCount = existingReferenceIds.filter((id) => !activeCharacterIds.includes(id)).length;
+    const remainingReferenceSlots = Math.max(0, MAX_REFERENCED_CHARACTERS - pulledReferenceCount);
     if (remainingReferenceSlots > 0) {
       const extraContext = await buildReferencedCharacterContext({
         db: input.db,
-        activeCharacterIds: [...(input.groupCharacterIds ?? input.characterIds), ...existingReferenceIds],
+        activeCharacterIds: [...activeCharacterIds, ...existingReferenceIds],
         sources: result.activatedEntries.map((entry) => entry.content),
         chatMessages: input.lorebookScanMessages ?? input.chatMessages,
         macroCtx,
@@ -456,6 +478,11 @@ export async function assemblePrompt(input: AssemblerInput): Promise<AssemblerOu
       ...entry,
       content: resolveReferenceMacros(entry.content),
     }));
+    if (result.imageEntries)
+      result.imageEntries = result.imageEntries.map((entry) => ({
+        ...entry,
+        content: resolveReferenceMacros(entry.content),
+      }));
     result.outlets = Object.fromEntries(
       Object.entries(result.outlets).map(([name, content]) => [name, resolveReferenceMacros(content)]),
     );
@@ -480,6 +507,7 @@ export async function assemblePrompt(input: AssemblerInput): Promise<AssemblerOu
     chatMessages: input.chatMessages,
     lorebookScanMessages: input.lorebookScanMessages,
     chatSummary,
+    chatSummaryReaders: input.chatSummaryReaders,
     advancedMemory: input.advancedMemory,
     wrapFormat,
     enableAgents: input.enableAgents ?? true,
@@ -503,6 +531,7 @@ export async function assemblePrompt(input: AssemblerInput): Promise<AssemblerOu
       setLorebookEntryCounts(macroCtx, lorebookEntryCounts);
       return resolveMacrosWithVariableSnapshot(value, macroCtx, deferNameMacroOptions);
     },
+    resolveLorebookDecisions: input.lorebookDecisions,
     onLorebookScan: addActivatedLorebookCardReferences,
     groupScenarioOverrideText: input.groupScenarioOverrideText ?? null,
     includeExampleDialogueInCharacterMarker: !hasDialogueExamplesMarker,
@@ -516,6 +545,7 @@ export async function assemblePrompt(input: AssemblerInput): Promise<AssemblerOu
   let lorebookDepthEntriesCount = 0;
   let hasChatSummaryMarker = false;
   let outletScanAttempted = false;
+  const usedImageOutlets = new Set<string>();
   let idMacroCardMarkerSection: ResolvedSection | null = null;
   const runtimeAgentTypesUsed = new Set<string>();
 
@@ -591,6 +621,7 @@ export async function assemblePrompt(input: AssemblerInput): Promise<AssemblerOu
         wrapFormat,
         runtimeAgentData: input.runtimeAgentData ?? {},
         runtimeAgentTypesUsed,
+        usedImageOutlets,
       });
     } catch (err) {
       logger.warn(err, "[prompt] Skipping section %s after marker expansion failed", section.id);
@@ -754,7 +785,23 @@ export async function assemblePrompt(input: AssemblerInput): Promise<AssemblerOu
       wrapFormat,
       macroCtx,
       deferAllMacroOptions,
+      input.chatSummaryReaders,
     );
+  }
+
+  if (markerCtx.lorebookScanResult?.imageEntries) {
+    markerCtx.lorebookScanResult = {
+      ...markerCtx.lorebookScanResult,
+      imageEntries: markerCtx.lorebookScanResult.imageEntries
+        .filter((entry) =>
+          entry.position === 7
+            ? usedImageOutlets.has(entry.outletName ?? "")
+            : entry.position === 2 ||
+              (entry.position <= 1 &&
+                markerCtx.lorebookPositionsEmitted?.has(entry.position <= 0 ? "before" : "after")),
+        )
+        .map((entry) => (entry.position === 7 ? { ...entry, outletUsed: true } : entry)),
+    };
   }
 
   // ── Phase 8: Single user message mode ──
@@ -777,6 +824,7 @@ export async function assemblePrompt(input: AssemblerInput): Promise<AssemblerOu
     parameters,
     macroVariables: { ...macroCtx.variables },
     macroAgentData: { ...(macroCtx.agentData ?? {}) },
+    referencedCharacterIds: Object.keys(macroCtx.characterReferences ?? {}),
     lorebookDepthEntriesCount,
     ...(markerCtx.updatedEntryStateOverrides
       ? { updatedEntryStateOverrides: markerCtx.updatedEntryStateOverrides }
@@ -818,6 +866,7 @@ interface ResolveSectionCtx {
   wrapFormat: WrapFormat;
   runtimeAgentData: Record<string, string | RuntimeAgentData>;
   runtimeAgentTypesUsed: Set<string>;
+  usedImageOutlets: Set<string>;
 }
 
 // ═══════════════════════════════════════════════
@@ -914,8 +963,25 @@ async function resolveSection(
     }
   }
 
+  // Track only outlets that macro resolution actually reads, so conditionals that drop one also drop its images.
+  const imageOutlets = new Set<string>();
+  const outlets = ctx.macroCtx.outlets;
+  const macroCtx = outlets
+    ? {
+        ...ctx.macroCtx,
+        outlets: new Proxy(outlets, {
+          get(target, key, receiver) {
+            if (typeof key === "string" && Object.hasOwn(target, key)) imageOutlets.add(key);
+            return Reflect.get(target, key, receiver);
+          },
+        }),
+      }
+    : ctx.macroCtx;
+
   // Resolve macros
-  content = contentMacrosResolved ? content : resolveMacros(content, ctx.macroCtx, macroOptions);
+  content = contentMacrosResolved ? content : resolveMacros(content, macroCtx, macroOptions);
+  // An image-only Outlet resolves to empty text but still claims its images.
+  for (const name of imageOutlets) ctx.usedImageOutlets.add(name);
   if (!content.trim()) return null;
   const shouldWrapRuntimeAgentSection = Boolean(
     runtimeAgentStartToken &&
@@ -924,8 +990,9 @@ async function resolveSection(
     content.includes(runtimeAgentText),
   );
 
-  // Auto-wrap in the preset's format
-  const wrapped = wrapContent(content, wrapperName, ctx.wrapFormat);
+  // Auto-wrap in the preset's format unless this prompt block opts out (markers always keep their wrapper)
+  const skipWrap = section.skipWrap === "true" && section.isMarker !== "true";
+  const wrapped = wrapContent(content, wrapperName, skipWrap ? "none" : ctx.wrapFormat);
   const messageContent = shouldWrapRuntimeAgentSection
     ? `${runtimeAgentStartToken}${wrapped || content}${runtimeAgentEndToken}`
     : wrapped || content;
@@ -1024,8 +1091,12 @@ export function appendFallbackChatSummaryToSystemPrompt(
   wrapFormat: WrapFormat,
   macroCtx: MacroContext,
   macroOptions?: ResolveMacroOptions,
+  readers?: readonly CharacterMacroProfile[],
 ): ChatMLMessage[] {
-  const summary = sanitizePromptLeaf(resolveMacros(chatSummary ?? "", macroCtx, macroOptions), wrapFormat).trim();
+  const summary = sanitizePromptLeaf(
+    resolveChatSummaryMacros(chatSummary ?? "", macroCtx, macroOptions, readers),
+    wrapFormat,
+  ).trim();
   if (!summary) return messages;
 
   const wrapped = wrapContent(summary, "Chat Summary", wrapFormat).trim();

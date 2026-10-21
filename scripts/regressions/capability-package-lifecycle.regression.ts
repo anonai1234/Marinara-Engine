@@ -104,7 +104,7 @@ try {
   const legacyManifest = capabilityPackageManifestSchema.parse(installedPackage("legacy", ["agent"]).manifest);
   assert.equal(legacyManifest.schemaVersion, 1, "Existing manifest v1 packages must remain readable");
   assert.equal(getCapabilityApiCompatibilityIssue(legacyManifest), null);
-  assert.deepEqual(supportedCapabilityApi, { major: 1, minor: 18 });
+  assert.deepEqual(supportedCapabilityApi, { major: 1, minor: 341 });
 
   const manifestV2 = capabilityPackageManifestSchema.parse({
     ...legacyManifest,
@@ -140,20 +140,72 @@ try {
   });
   assert.match(
     getCapabilityApiCompatibilityIssue(unsupportedMajorManifest) ?? "",
-    /requires capability API 2\.0; this Engine supports 1\.18/,
+    /requires capability API 2\.0; this Engine supports 1\.341/,
   );
   const currentMinorManifest = capabilityPackageManifestSchema.parse({
     ...manifestV2,
-    capabilityApi: { major: 1, minor: 18 },
+    capabilityApi: { major: 1, minor: 341 },
   });
   assert.equal(getCapabilityApiCompatibilityIssue(currentMinorManifest), null);
+  assert.equal(
+    getCapabilityApiCompatibilityIssue({
+      ...currentMinorManifest,
+      capabilityApi: { major: 1, minor: 28 },
+    }),
+    null,
+    "the pre-merge capability minor remains compatible",
+  );
+  // Every minor this Engine added stays installable alongside the newest.
+  const supportedMinors: Array<[number, string]> = [
+    [144, "party sheet"],
+    [151, "builder choices"],
+    [152, "builder allocation"],
+    [153, "builder spending"],
+    [154, "builder named rows"],
+    [155, "builder legality"],
+    [156, "contextual effects"],
+    [157, "starting coins"],
+    [158, "starting values"],
+    [159, "priced choices"],
+    [160, "creation profiles"],
+    [161, "row checks"],
+    [162, "creation rolls"],
+    [163, "shared party creation"],
+    [164, "trades"],
+    [205, "row counts"],
+    [206, "row prices"],
+    [207, "unpriced offers"],
+    [208, "more fields"],
+    [209, "roll abilities"],
+    [210, "worked-out list columns"],
+    [211, "partial score increases"],
+    [212, "row check stances"],
+    [213, "ability specialties"],
+    [214, "no-cancel check effects"],
+    [215, "item access"],
+    [216, "row dots"],
+    [217, "best-rating check effects"],
+    [218, "track costs"],
+    [219, "advancement lists up to 64 fields"],
+    [339, "the Game Master's intro message"],
+    [340, "the newest minor before this one"],
+  ];
+  for (const [minor, label] of supportedMinors) {
+    assert.equal(
+      getCapabilityApiCompatibilityIssue(
+        capabilityPackageManifestSchema.parse({ ...manifestV2, capabilityApi: { major: 1, minor } }),
+      ),
+      null,
+      `Capability API 1.${minor} (${label}) is supported`,
+    );
+  }
   const unsupportedMinorManifest = capabilityPackageManifestSchema.parse({
     ...manifestV2,
-    capabilityApi: { major: 1, minor: 19 },
+    capabilityApi: { major: 1, minor: 342 },
   });
   assert.match(
     getCapabilityApiCompatibilityIssue(unsupportedMinorManifest) ?? "",
-    /requires capability API 1\.19; this Engine supports 1\.18/,
+    /requires capability API 1\.342; this Engine supports 1\.341/,
   );
   const startupManifest = {
     ...currentMinorManifest,
@@ -399,12 +451,14 @@ try {
   const serverRequire = createRequire(new URL("../../packages/server/src/app.ts", import.meta.url));
   const AdmZipCtor = serverRequire("adm-zip") as new () => {
     addFile: (name: string, data: Buffer) => void;
+    toBuffer: () => Buffer;
   };
+  const { openZipArchive } = await import("../../packages/server/src/lib/zip-reader.js");
   const collisionZip = new AdmZipCtor();
   collisionZip.addFile("art/tiles.png", Buffer.from("first casing"));
   collisionZip.addFile("art/Tiles.PNG", Buffer.from("second casing"));
   assert.throws(
-    () => validatePackageArchiveEntries(collisionZip as never),
+    () => validatePackageArchiveEntries(openZipArchive(collisionZip.toBuffer())),
     /duplicate file/u,
     "case-only filename collisions must be rejected at archive validation",
   );
@@ -622,7 +676,7 @@ try {
   deactivateReactivatedRoutes();
   deactivateInitialRoutes();
 
-  const { withLongTermMemoryRuntimeTimeout } =
+  const { withLongTermMemoryEmbeddingChange, withLongTermMemoryRuntimeTimeout } =
     await import("../../packages/server/src/services/generation/long-term-memory-runtime.js");
   const timeoutStartedAt = Date.now();
   await assert.rejects(
@@ -639,6 +693,16 @@ try {
     capabilityLanguageModelSource,
     /reasoningEffort:\s*options\.reasoningEffort,/u,
     "Capability model calls must preserve an explicit reasoning effort of none",
+  );
+  assert.match(
+    capabilityLanguageModelSource,
+    /AbortSignal\.any\(\[options\.signal,\s*timeoutSignal\]\)[\s\S]*withLlmRequestTimeout\(\s*timeoutMs,\s*async\s*\(\)\s*=>[\s\S]*provider\.chatComplete\(/u,
+    "Capability model calls must enforce AGENT_CALL_TIMEOUT_MS as a total-duration cap while scoping the transport timeout",
+  );
+  assert.match(
+    capabilityLanguageModelSource,
+    /const\s+timeoutSignal\s*=\s*AbortSignal\.timeout\(\s*timeoutMs\s*\);/u,
+    "Capability model calls must build their deadline signal from AbortSignal.timeout",
   );
   assert.doesNotMatch(
     capabilityLanguageModelSource,
@@ -1410,7 +1474,7 @@ try {
   );
   if (configuredDataDir === undefined) delete process.env.DATA_DIR;
   else process.env.DATA_DIR = configuredDataDir;
-  const { getCapabilityService } =
+  const { getCapabilityService, registerCapabilityService } =
     await import("../../packages/server/src/services/capability-packages/capability-service-registry.service.js");
   const { closeDB, getDB } = await import("../../packages/server/src/db/connection.js");
   closeDatabase = closeDB;
@@ -1456,6 +1520,41 @@ try {
     caseDistinctEmbeddingHost.spaceId,
     "opaque embedding model IDs must retain case distinctions",
   );
+  // Engine save/header contract only; reuse the existing connection fixture.
+  let refreshedModel: string | undefined;
+  const refreshHeaders: unknown[][] = [];
+  const refreshReply = {
+    header(name: string, value: unknown) {
+      refreshHeaders.push([name, value]);
+      return undefined!;
+    },
+  };
+  const releaseRefresh = registerCapabilityService("long-term-memory:runtime", {
+    async refresh({ signal }: { signal: AbortSignal }) {
+      signal.throwIfAborted();
+      refreshedModel = (await connections.getById(remoteEmbeddingConnection.id))?.embeddingModel;
+      if (refreshedModel === "failed-model") throw new Error("Refresh fixture failed");
+      return { status: "refreshed" };
+    },
+  });
+  try {
+    for (const embeddingModel of ["refreshed-model", "refreshed-model", "failed-model"]) {
+      const saved = await withLongTermMemoryEmbeddingChange(db, refreshReply, () =>
+        connections.update(remoteEmbeddingConnection.id, { embeddingModel }),
+      );
+      assert.equal(saved?.embeddingModel, embeddingModel);
+      assert.equal(refreshedModel, embeddingModel, "refresh must observe the persisted save before it returns");
+    }
+    assert.deepEqual(refreshHeaders, [
+      ["X-Marinara-LTM-Refresh", "refreshed"],
+      ["X-Marinara-LTM-Refresh", "failed"],
+    ]);
+  } finally {
+    releaseRefresh();
+    await connections.update(remoteEmbeddingConnection.id, {
+      embeddingModel: remoteEmbeddingConnection.embeddingModel,
+    });
+  }
   const { createCapabilityPersistenceHost } =
     await import("../../packages/server/src/services/capability-packages/capability-persistence.service.js");
   const { createCapabilityResourceHost } =
@@ -1918,7 +2017,9 @@ try {
   assert.equal(getCapabilityService("readiness:success"), null, "Runtime stop must remove ready contributions");
   const runtimeSnapshotsRoot = join(dataDir, "capability-runtime-snapshots");
   assert.equal(
-    existsSync(runtimeSnapshotsRoot) ? readdirSync(runtimeSnapshotsRoot).length : 0,
+    existsSync(runtimeSnapshotsRoot)
+      ? readdirSync(runtimeSnapshotsRoot).filter((entry) => entry !== "node_modules").length
+      : 0,
     0,
     "runtime snapshots are retained during activation and removed at stop",
   );

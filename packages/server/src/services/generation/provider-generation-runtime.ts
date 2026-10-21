@@ -1,4 +1,5 @@
 import {
+  capabilityModelId,
   isClaudeAdaptiveOnlyNoSamplingModel,
   normalizeThinkingTagPairs,
   resolveManagedGenerationParameters,
@@ -19,7 +20,11 @@ import {
   resolveProviderTopK,
 } from "../../routes/generate/generate-route-utils.js";
 import { mergeModelContextLimit, resolveStoredModelContextLimit } from "./model-access-policy.js";
-import { normalizeChatTopP, supportsAssistantReasoningPrefill } from "./generation-parameters.js";
+import {
+  keepsCodexDefaultEffort,
+  normalizeChatTopP,
+  supportsAssistantReasoningPrefill,
+} from "./generation-parameters.js";
 import { clampGenerationMaxOutputTokens } from "./output-token-limits.js";
 import {
   isFallbackConnectionUsable,
@@ -30,6 +35,7 @@ import {
 import type { GenerationFallbackNotifier } from "./fallback-notification.js";
 
 type GenerationConnection = {
+  name?: string | null;
   provider: string;
   model: string;
   apiKey: string;
@@ -41,7 +47,42 @@ type GenerationConnection = {
   treatAsLocalEndpoint?: unknown;
 };
 
-type GenerationProviderRuntimeArgs = {
+type GenerationParameterValues = {
+  temperature: number | undefined;
+  maxTokens: number;
+  topP: number | undefined;
+  topK: number;
+  minP: number;
+  frequencyPenalty: number;
+  presencePenalty: number;
+  showThoughts: boolean;
+  reasoningEffort: "low" | "medium" | "high" | "xhigh" | "maximum" | null;
+  verbosity: "low" | "medium" | "high" | null;
+  serviceTier: "flex" | "priority" | null;
+  assistantPrefill: string;
+  assistantReasoningPrefill: string;
+  customThinkingTags: ThinkingTagPair[];
+  customParameters: Record<string, unknown>;
+  enabledParameters: GenerationParameterSendMap | undefined;
+  stopSequences: string[];
+  effectiveMaxContext: number | undefined;
+};
+
+export type GenerationParameterArgs = {
+  connection: Pick<GenerationConnection, "provider" | "model" | "maxTokensOverride" | "defaultParameters">;
+  chatMode: string;
+  isSceneChat: boolean;
+  chatParameters: unknown;
+  managedParameterDefinitions: ManagedGenerationParameterDefinition[];
+  modelAccessPolicy: Parameters<typeof mergeModelContextLimit>[0];
+  initialSources?: Record<string, string>;
+  /** A reasoning effort of `undefined` means nothing chose one yet: no level is sent and thinking stays off. */
+  initial: Omit<GenerationParameterValues, "reasoningEffort"> & {
+    reasoningEffort: GenerationParameterValues["reasoningEffort"] | undefined;
+  };
+};
+
+type GenerationProviderRuntimeArgs = GenerationParameterArgs & {
   connectionId: string;
   connection: GenerationConnection;
   baseUrl: string;
@@ -49,35 +90,11 @@ type GenerationProviderRuntimeArgs = {
   fallbackBaseUrl?: string;
   onFallback?: GenerationFallbackNotifier;
   onProviderUsed?: (origin: GenerationProviderOrigin) => void;
-  chatMode: string;
-  isSceneChat: boolean;
-  chatParameters: unknown;
-  managedParameterDefinitions: ManagedGenerationParameterDefinition[];
-  modelAccessPolicy: Parameters<typeof mergeModelContextLimit>[0];
-  initialSources?: Record<string, string>;
-  initial: {
-    temperature: number | undefined;
-    maxTokens: number;
-    topP: number | undefined;
-    topK: number;
-    minP: number;
-    frequencyPenalty: number;
-    presencePenalty: number;
-    showThoughts: boolean;
-    reasoningEffort: "low" | "medium" | "high" | "xhigh" | "maximum" | null;
-    verbosity: "low" | "medium" | "high" | null;
-    serviceTier: "flex" | "priority" | null;
-    assistantPrefill: string;
-    assistantReasoningPrefill: string;
-    customThinkingTags: ThinkingTagPair[];
-    customParameters: Record<string, unknown>;
-    enabledParameters: GenerationParameterSendMap | undefined;
-    stopSequences: string[];
-    effectiveMaxContext: number | undefined;
-  };
+  wrapProvider?: (provider: BaseLLMProvider) => BaseLLMProvider;
+  initial: GenerationParameterValues;
 };
 
-export type GenerationProviderRuntime = GenerationProviderRuntimeArgs["initial"] & {
+export type ResolvedGenerationParameters = GenerationParameterArgs["initial"] & {
   parameterSources: Record<string, string>;
   connectionParams: ReturnType<typeof parseStoredGenerationParameters>;
   chatParams: ReturnType<typeof parseStoredGenerationParameters>;
@@ -86,12 +103,20 @@ export type GenerationProviderRuntime = GenerationProviderRuntimeArgs["initial"]
   enableThinking: boolean;
   isClaudeNoSampling: boolean;
   providerTopK: number | undefined;
-  supportsAssistantReasoningPrefill: boolean;
-  primaryProvider: BaseLLMProvider;
-  provider: BaseLLMProvider;
 };
 
-export function resolveGenerationProviderRuntime(args: GenerationProviderRuntimeArgs): GenerationProviderRuntime {
+export type GenerationProviderRuntime = GenerationParameterValues &
+  Omit<ResolvedGenerationParameters, keyof GenerationParameterValues> & {
+    supportsAssistantReasoningPrefill: boolean;
+    primaryProvider: BaseLLMProvider;
+    provider: BaseLLMProvider;
+  };
+
+/**
+ * Layer the saved generation parameters (defaults, then connection, then chat) and apply the provider and model rules
+ * the main chat sends with. Agent calls and package calls reuse it with the connection layer alone (#7131).
+ */
+export function resolveGenerationParameters(args: GenerationParameterArgs): ResolvedGenerationParameters {
   const connectionParams = parseStoredGenerationParameters(args.connection.defaultParameters);
   const chatParams = parseStoredGenerationParameters(args.chatParameters);
   const runtime = { ...args.initial };
@@ -146,7 +171,6 @@ export function resolveGenerationProviderRuntime(args: GenerationProviderRuntime
     if (runtime.effectiveMaxContext !== previousContext) parameterSources.effectiveMaxContext = source;
   };
 
-  const isLocalGemma = (args.connection.model ?? "").toLowerCase().includes("gemma");
   applyParameterOverrides(connectionParams, "connection");
   applyParameterOverrides(chatParams, "chat");
   runtime.customParameters = mergeCustomParameters(
@@ -162,22 +186,7 @@ export function resolveGenerationProviderRuntime(args: GenerationProviderRuntime
     forceParameters("scene", { maxTokens: 8192, reasoningEffort: "maximum", verbosity: "high" });
   }
 
-  if (args.chatMode === "game" && !isLocalGemma) {
-    forceParameters("game", {
-      temperature: 1,
-      maxTokens: 16_384,
-      topP: 1,
-      topK: 0,
-      minP: 0,
-      frequencyPenalty: 0,
-      presencePenalty: 0,
-      reasoningEffort: "maximum",
-      verbosity: null,
-    });
-  }
-
   if (args.chatMode === "game") {
-    if (runtime.maxTokens < 16_384) forceParameters("game", { maxTokens: 16_384 });
     const capped = clampGenerationMaxOutputTokens({
       provider: args.connection.provider,
       model: args.connection.model,
@@ -187,8 +196,12 @@ export function resolveGenerationProviderRuntime(args: GenerationProviderRuntime
     if (capped < runtime.maxTokens) forceParameters("outputCap", { maxTokens: capped });
   }
 
-  const modelLower = (args.connection.model ?? "").toLowerCase();
+  const modelLower = capabilityModelId(args.connection.model ?? "");
   const providerLower = (args.connection.provider ?? "").toLowerCase();
+  const isCodex = providerLower === "openai_chatgpt";
+  if (runtime.reasoningEffort !== null && keepsCodexDefaultEffort(providerLower, connectionParams, chatParams)) {
+    forceParameters("defaults", { reasoningEffort: null });
+  }
   let resolvedEffort = resolveProviderReasoningEffort({
     provider: providerLower,
     model: modelLower,
@@ -203,8 +216,10 @@ export function resolveGenerationProviderRuntime(args: GenerationProviderRuntime
   const providerReasoningEffort =
     runtime.enabledParameters?.reasoningEffort === false
       ? undefined
-      : runtime.reasoningEffort === null
-        ? "none"
+      : runtime.reasoningEffort === null && !resolvedEffort
+        ? isCodex
+          ? undefined
+          : "none"
         : (resolvedEffort ?? undefined);
   const isClaudeNoSampling = isClaudeAdaptiveOnlyNoSamplingModel(modelLower);
   if (isClaudeNoSampling) {
@@ -225,6 +240,64 @@ export function resolveGenerationProviderRuntime(args: GenerationProviderRuntime
   }
 
   const providerTopK = resolveProviderTopK(runtime.topK);
+  return {
+    ...runtime,
+    parameterSources,
+    connectionParams,
+    chatParams,
+    resolvedEffort,
+    providerReasoningEffort,
+    enableThinking,
+    isClaudeNoSampling,
+    providerTopK,
+  };
+}
+
+/**
+ * The level `{{reasoning}}` reads: what this request asks the model for (`low` to `max`), or `off` when thinking stays
+ * off. Macros resolve while the prompt is built, before the request's parameters are, so this runs the same layering
+ * early from the base level (the preset's, or the default without one).
+ */
+export function resolveReasoningMacroValue(args: {
+  connection: Pick<GenerationConnection, "provider" | "model" | "maxTokensOverride" | "defaultParameters">;
+  chatMode: string;
+  isSceneChat: boolean;
+  chatParameters: unknown;
+  baseReasoningEffort: GenerationParameterValues["reasoningEffort"] | undefined;
+}): string {
+  const { resolvedEffort } = resolveGenerationParameters({
+    connection: args.connection,
+    chatMode: args.chatMode,
+    isSceneChat: args.isSceneChat,
+    chatParameters: args.chatParameters,
+    managedParameterDefinitions: [],
+    modelAccessPolicy: { suppressModelParameters: false },
+    initial: {
+      temperature: undefined,
+      maxTokens: 0,
+      topP: undefined,
+      topK: 0,
+      minP: 0,
+      frequencyPenalty: 0,
+      presencePenalty: 0,
+      showThoughts: false,
+      reasoningEffort: args.baseReasoningEffort,
+      verbosity: null,
+      serviceTier: null,
+      assistantPrefill: "",
+      assistantReasoningPrefill: "",
+      customThinkingTags: [],
+      customParameters: {},
+      enabledParameters: undefined,
+      stopSequences: [],
+      effectiveMaxContext: undefined,
+    },
+  });
+  return resolvedEffort ?? "off";
+}
+
+export function resolveGenerationProviderRuntime(args: GenerationProviderRuntimeArgs): GenerationProviderRuntime {
+  const parameters = resolveGenerationParameters(args);
   const primaryProvider =
     args.connectionId === LOCAL_SIDECAR_CONNECTION_ID
       ? getLocalSidecarProvider()
@@ -250,7 +323,9 @@ export function resolveGenerationProviderRuntime(args: GenerationProviderRuntime
   );
   const provider = withConnectionFallbackProvider({
     primary: primaryProvider,
+    wrapProvider: args.wrapProvider,
     primaryConnectionId: args.connectionId,
+    primaryConnectionName: args.connection.name,
     fallbackConnection: args.fallbackConnection,
     fallbackBaseUrl: args.fallbackBaseUrl ?? "",
     category: "main",
@@ -261,15 +336,9 @@ export function resolveGenerationProviderRuntime(args: GenerationProviderRuntime
   });
 
   return {
-    ...runtime,
-    parameterSources,
-    connectionParams,
-    chatParams,
-    resolvedEffort,
-    providerReasoningEffort,
-    enableThinking,
-    isClaudeNoSampling,
-    providerTopK,
+    ...parameters,
+    // The main chat always starts from a chosen level or Off, so this never turns undefined into null.
+    reasoningEffort: parameters.reasoningEffort ?? null,
     supportsAssistantReasoningPrefill:
       primarySupportsAssistantReasoningPrefill || fallbackSupportsAssistantReasoningPrefill,
     primaryProvider,

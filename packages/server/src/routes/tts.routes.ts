@@ -11,7 +11,13 @@ import { join } from "path";
 import {
   ttsConfigSchema,
   ttsSourceProfileFromConfig,
+  ttsConnectionProfileFromConfig,
+  ttsVoiceAssignmentInputSchema,
+  ttsVoiceModeInputSchema,
+  setCharacterVoiceAssignment,
+  TTS_VOICE_MAX_LENGTH,
   normalizeMusicEnemyTier,
+  resolveTtsRequestTimeoutMs,
   TTS_SETTINGS_KEY,
   TTS_API_KEY_MASK,
   ttsRoleplaySpeakerExtractorResponseSchema,
@@ -23,6 +29,7 @@ import {
   type TTSVoicesResponse,
 } from "@marinara-engine/shared";
 import { createAppSettingsStorage } from "../services/storage/app-settings.storage.js";
+import { TTS_EMOTION_CUE_GUIDANCE } from "../services/tts-emotion-guidance.js";
 import { createConnectionsStorage } from "../services/storage/connections.storage.js";
 import { encryptApiKey, decryptApiKey } from "../utils/crypto.js";
 import { getChatGenerationTimeoutMs, isTtsLocalUrlsEnabled } from "../config/runtime-config.js";
@@ -147,7 +154,7 @@ const speakSchema = z.object({
   text: z.string().min(1).max(4096),
   speaker: z.string().max(120).optional(),
   tone: z.string().max(80).optional(),
-  voice: z.string().max(200).optional(),
+  voice: z.string().max(TTS_VOICE_MAX_LENGTH).optional(),
   /** Optional audio-connection override (#5146); absent = default/legacy resolution. */
   audioConnectionId: z.string().optional(),
 });
@@ -327,6 +334,7 @@ export async function generateRoleplaySoundEffect(
   signal?.throwIfAborted();
   const cfg = await resolveAudioConfig(createAppSettingsStorage(db), createConnectionsStorage(db), connectionId);
   signal?.throwIfAborted();
+  if (cfg.connectionUnavailable) throw new Error(TTS_CONNECTION_UNAVAILABLE);
   if (cfg.source !== "elevenlabs" || cfg.elevenLabsGameSoundEffects !== true || !cfg.apiKey)
     throw new Error("Choose an ElevenLabs audio connection with sound effect generation enabled.");
   const normalized = normalizeGameAudioPrompt(prompt);
@@ -372,7 +380,7 @@ export function buildRoleplaySpeakerExtractorPrompt(input: {
     ? `This response was generated for ${input.messageAuthor}. Use that exact name for dialogue not explicitly attributed to a different speaker.`
     : "";
   const emotionInstruction = input.includeEmotions
-    ? 'In "speech", copy the exact dialogue and insert emotional indicators directly in [brackets] before the words they affect. You may use multiple bracketed emotional indicators within a dialogue line, including pauses, small sounds, sighs, and different intonations for different parts. Do not otherwise add, remove, reorder, or rewrite any dialogue.'
+    ? `In "speech", copy the exact dialogue and insert emotional indicators directly in [brackets] before the words they affect. ${TTS_EMOTION_CUE_GUIDANCE} Preserve every original word, punctuation mark, quote, and space; only insert bracketed cues and their separating spaces. Do not otherwise add, remove, reorder, or rewrite any dialogue.`
     : 'Do not add emotional indicators. Omit the "speech" field.';
 
   return `You are preparing a message for text-to-speech reading from a roleplay chat between ${roleplayName} and ${input.user}, but it is possible there are other characters involved and mentioned in the message itself.
@@ -391,7 +399,7 @@ A pregnant pause settles in the room.
 "Skill issue," Mari chuckles, crossing her arms.
 
 Example output:
-{"dialogue":[{"speaker":"Dottore","text":"\\\"I've had enough of your shenanigans,\\\""${input.includeEmotions ? ',"speech":"[irritated] \\\"I\'ve had enough of your shenanigans,\\\""' : ""}},{"speaker":"Dottore","text":"\\\"You're wasting my time, subject. This is your last chance to change my mind before I send you to Lab Thirteen.\\\""${input.includeEmotions ? ',"speech":"[irritated] \\\"You\'re wasting my time, subject. [sigh] This is your last chance to change my mind before I send you to Lab Thirteen.\\\""' : ""}},{"speaker":"Mari","text":"\\\"Skill issue,\\\""${input.includeEmotions ? ',"speech":"[chuckle] \\\"Skill issue,\\\""' : ""}}]}`;
+{"dialogue":[{"speaker":"Dottore","text":"\\\"I've had enough of your shenanigans,\\\""${input.includeEmotions ? ',"speech":"[Low, steady voice, restrained irritation] \\\"I\'ve had enough of your shenanigans,\\\""' : ""}},{"speaker":"Dottore","text":"\\\"You're wasting my time, subject. This is your last chance to change my mind before I send you to Lab Thirteen.\\\""${input.includeEmotions ? ',"speech":"[Firm, controlled impatience] \\\"You\'re wasting my time, subject. [sigh] This is your last chance to change my mind before I send you to Lab Thirteen.\\\""' : ""}},{"speaker":"Mari","text":"\\\"Skill issue,\\\""${input.includeEmotions ? ',"speech":"[Dry chuckle, faint amusement] \\\"Skill issue,\\\""' : ""}}]}`;
 }
 
 export function buildRoleplaySpeakerExtractorUserPrompt(message: string): string {
@@ -484,16 +492,29 @@ function withoutTemperatureCustomParameter(value: Record<string, unknown> | unde
   return Object.fromEntries(Object.entries(value).filter(([key]) => key.toLowerCase() !== "temperature"));
 }
 
-function parseStoredConfig(raw: string | null) {
+/** The stored config, or null when one is stored that this version cannot read. */
+function readStoredConfig(raw: string | null): TTSConfig | null {
   if (!raw) return ttsConfigSchema.parse({});
   try {
     return ttsConfigSchema.parse(JSON.parse(raw));
   } catch {
-    return ttsConfigSchema.parse({});
+    return null;
   }
 }
 
+function parseStoredConfig(raw: string | null) {
+  return readStoredConfig(raw) ?? ttsConfigSchema.parse({});
+}
+
+/** The top-level voice and speech fields, copied to the profile of the source or Audio connection chosen. */
 function withActiveSourceProfile(config: TTSConfig): TTSConfig {
+  const connectionId = config.connectionId.trim();
+  if (connectionId) {
+    return {
+      ...config,
+      connectionProfiles: { ...config.connectionProfiles, [connectionId]: ttsConnectionProfileFromConfig(config) },
+    };
+  }
   return {
     ...config,
     sourceProfiles: {
@@ -546,12 +567,29 @@ export function prepareTTSConfigForStorage(
     };
   }
 
+  const connectionProfiles = { ...existing.connectionProfiles, ...input.connectionProfiles };
+  const connectionId = input.connectionId.trim();
+  if (connectionId) {
+    // The connection supplies the address, key and model, so the source's own stay exactly as stored.
+    return withActiveSourceProfile({
+      ...input,
+      source: existing.source,
+      baseUrl: existing.baseUrl,
+      apiKey: existing.apiKey,
+      model: existing.model,
+      connectionId,
+      sourceProfiles,
+      connectionProfiles,
+    });
+  }
+
   const apiKey =
     input.apiKey === TTS_API_KEY_MASK ? (existingProfiles[input.source]?.apiKey ?? "") : encryptKey(input.apiKey);
   const storedConfig: TTSConfig = {
     ...input,
     apiKey,
     sourceProfiles,
+    connectionProfiles,
   };
   storedConfig.sourceProfiles[input.source] = ttsSourceProfileFromConfig(storedConfig);
   return storedConfig;
@@ -570,25 +608,31 @@ async function loadConfig(storage: ReturnType<typeof createAppSettingsStorage>) 
 
 /**
  * Resolve the effective audio configuration (#5146): an audio CONNECTION —
- * the explicitly requested one, else the category default — provides the
- * identity half (source, key, base URL, voice, and the sound-effect/music
- * capability flags), overlaid on the legacy TTS settings blob, which remains
- * the knob store (speed, stability, extractor settings, source profiles).
+ * the explicitly requested one, else the one chosen as the TTS card's Source
+ * (#7848), else the category default — provides the identity half (source,
+ * key, base URL, voice, and the sound-effect/music capability flags),
+ * overlaid on the legacy TTS settings blob, which remains the knob store
+ * (speed, stability, extractor settings, source profiles).
  * With no audio connection at all, behavior is exactly the legacy blob —
  * pre-migration installs keep working untouched.
  */
-/** Callers pass this sentinel to force the legacy settings blob even when audio connections exist. */
+/**
+ * Callers pass this sentinel for the TTS card's own choice: its Audio connection when one is
+ * chosen, else its source settings even when audio connections exist.
+ */
 export const LEGACY_TTS_CONFIG_SENTINEL = "";
+
+const TTS_CONNECTION_UNAVAILABLE = "The Audio connection chosen for Text to Speech is missing or unavailable.";
+
+type ResolvedAudioConfig = TTSConfig & { connectionName?: string; connectionUnavailable?: true };
 
 async function resolveAudioConfig(
   storage: ReturnType<typeof createAppSettingsStorage>,
   connections: ReturnType<typeof createConnectionsStorage>,
   requestedConnectionId?: string | null,
-) {
+): Promise<ResolvedAudioConfig> {
   const cfg = await loadConfig(storage);
-  // The TTS settings card tests the blob it edits; the empty-string sentinel
-  // must reach it even when a default audio connection exists.
-  if (requestedConnectionId === LEGACY_TTS_CONFIG_SENTINEL) return cfg;
+  const chosenConnectionId = cfg.connectionId.trim();
   let row = null;
   let explicitlyRequested = false;
   if (requestedConnectionId) {
@@ -600,16 +644,23 @@ async function resolveAudioConfig(
       logger.warn("Requested audio connection %s missing or not audio; using the default", requestedConnectionId);
     }
   }
+  if (!row && chosenConnectionId) {
+    const candidate = await connections.getWithKey(chosenConnectionId);
+    if (candidate?.provider !== "audio") {
+      // Never another connection's credentials, nor the card's own: the user chose this one.
+      logger.warn("The TTS audio connection %s is missing or unavailable", chosenConnectionId);
+      return { ...cfg, apiKey: "", connectionUnavailable: true };
+    }
+    row = candidate;
+  }
+  // The TTS settings card tests the blob it edits; the empty-string sentinel
+  // must reach it even when a default audio connection exists.
+  if (!row && requestedConnectionId === LEGACY_TTS_CONFIG_SENTINEL) return cfg;
   if (!row) row = await connections.getDefaultForAudio();
   if (!row) row = await connections.getFallbackForAudio();
   if (!row) return cfg;
   const source = (row.audioSource ?? "elevenlabs") as TTSSource;
-  // Blank row fields fall back per the ROW's source. The blob's top-level
-  // fields belong to its own active source — inheriting them would leak
-  // cross-source values (e.g. the schema-default voice "alloy" into an
-  // ElevenLabs row, defeating the missing-voice guard downstream).
-  const profile = source === cfg.source ? cfg : withActiveSourceProfile(cfg).sourceProfiles[source];
-  return {
+  const resolved = {
     ...cfg,
     // An explicitly requested connection is a direct expression of intent;
     // default/fallback resolution keeps honoring the legacy master toggle so
@@ -617,11 +668,51 @@ async function resolveAudioConfig(
     enabled: explicitlyRequested ? true : cfg.enabled,
     source,
     apiKey: row.apiKey,
+    elevenLabsGameSoundEffects: row.audioSoundEffects === "true",
+    elevenLabsGameMusic: row.audioMusic === "true",
+    // The connection's own limit, never the settings card's: each one is set where its server is.
+    requestTimeoutMs: resolveTtsRequestTimeoutMs(row.audioTimeoutMs),
+    connectionName: row.name,
+  };
+  const connectionProfile = withActiveSourceProfile(cfg).connectionProfiles[row.id];
+  if (connectionProfile) {
+    // A connection with its own card profile uses only its own address, model and voices, so two
+    // connections on the same adapter never borrow each other's or the source settings'.
+    return {
+      ...resolved,
+      ...connectionProfile,
+      baseUrl: row.baseUrl || TTS_SOURCE_DEFAULTS[source].baseUrl,
+      voice: connectionProfile.voice || row.audioVoice || "",
+      model: row.model || TTS_SOURCE_DEFAULTS[source].model,
+    };
+  }
+  // Blank row fields fall back per the ROW's source. The blob's top-level
+  // fields belong to its own active source — inheriting them would leak
+  // cross-source values (e.g. the schema-default voice "alloy" into an
+  // ElevenLabs row, defeating the missing-voice guard downstream).
+  const profile =
+    source === cfg.source && !chosenConnectionId ? cfg : withActiveSourceProfile(cfg).sourceProfiles[source];
+  return {
+    ...resolved,
     baseUrl: row.baseUrl || profile?.baseUrl || TTS_SOURCE_DEFAULTS[source].baseUrl,
     voice: row.audioVoice || profile?.voice || "",
     model: row.model || profile?.model || TTS_SOURCE_DEFAULTS[source].model,
-    elevenLabsGameSoundEffects: row.audioSoundEffects === "true",
-    elevenLabsGameMusic: row.audioMusic === "true",
+  };
+}
+
+/** The TTS card's Audio connection for display: its adapter, address and model, never its key. */
+async function readChosenConnectionIdentity(
+  connections: ReturnType<typeof createConnectionsStorage>,
+  connectionId: string,
+): Promise<Pick<TTSConfig, "source" | "baseUrl" | "model"> | null> {
+  if (!connectionId) return null;
+  const row = await connections.getById(connectionId);
+  if (row?.provider !== "audio" || row.profileImportReviewRequired === "true") return null;
+  const source = (row.audioSource ?? "elevenlabs") as TTSSource;
+  return {
+    source,
+    baseUrl: row.baseUrl || TTS_SOURCE_DEFAULTS[source].baseUrl,
+    model: row.model || TTS_SOURCE_DEFAULTS[source].model,
   };
 }
 
@@ -1006,6 +1097,90 @@ export function resolveTTSAudioResponseContentType(contentType: string | null, b
   return detectTTSAudioMimeType(bytes);
 }
 
+/** OpenRouter exposes model-specific PCM layout in Content-Type, not a universal 24 kHz rate.
+ * https://github.com/OpenRouterTeam/skills/blob/main/skills/openrouter-tts/SKILL.md
+ * Only the official OpenAI endpoint has a documented fixed PCM layout fallback.
+ * https://developers.openai.com/api/docs/guides/text-to-speech#supported-output-formats
+ */
+export function resolveTTSPcmFormat(contentType: string | null, baseUrl: string) {
+  const parameters = new Map<string, string>();
+  for (const parameter of (contentType ?? "").split(";").slice(1)) {
+    const separator = parameter.indexOf("=");
+    const name = (separator < 0 ? parameter : parameter.slice(0, separator)).trim().toLowerCase();
+    if (name !== "rate" && name !== "channels") continue;
+    if (separator < 0) throw new Error(`TTS provider returned invalid PCM ${name} metadata`);
+    if (parameters.has(name)) throw new Error(`TTS provider returned duplicate PCM ${name} metadata`);
+    parameters.set(
+      name,
+      parameter
+        .slice(separator + 1)
+        .trim()
+        .replace(/^"(.*)"$/, "$1"),
+    );
+  }
+  let officialOpenAi = false;
+  try {
+    const url = new URL(baseUrl);
+    officialOpenAi = url.protocol === "https:" && url.hostname === "api.openai.com";
+  } catch {
+    // An invalid/custom URL cannot establish a provider-specific audio contract.
+  }
+  const readParameter = (name: string, fallback: number, min: number, max: number) => {
+    const value = parameters.get(name);
+    if (value === undefined && officialOpenAi) return fallback;
+    if (value === undefined) {
+      throw new Error(`TTS provider omitted PCM ${name}; return audio/pcm with rate and channels, or select WAV/MP3`);
+    }
+    const parsed = Number(value);
+    if (!/^\d+$/.test(value) || !Number.isSafeInteger(parsed) || parsed < min || parsed > max) {
+      throw new Error(`TTS provider returned invalid PCM ${name} metadata`);
+    }
+    return parsed;
+  };
+  return { sampleRate: readParameter("rate", 24_000, 8_000, 192_000), channels: readParameter("channels", 1, 1, 8) };
+}
+
+/** Wrap signed 16-bit little-endian samples for browser playback without changing the samples. */
+export function wrapTTSPcm16AsWav(pcm: Uint8Array, format: { sampleRate: number; channels: number }): Uint8Array {
+  const { sampleRate, channels } = format;
+  if (
+    !Number.isInteger(sampleRate) ||
+    sampleRate < 8_000 ||
+    sampleRate > 192_000 ||
+    !Number.isInteger(channels) ||
+    channels < 1 ||
+    channels > 8
+  ) {
+    throw new Error("TTS provider returned invalid PCM layout");
+  }
+  const blockAlign = channels * 2;
+  if (pcm.byteLength === 0) throw new Error("TTS provider returned empty PCM audio");
+  if (pcm.byteLength % blockAlign !== 0)
+    throw new Error("TTS provider returned malformed PCM audio (incomplete frame)");
+
+  const wav = new Uint8Array(44 + pcm.byteLength);
+  const view = new DataView(wav.buffer);
+  const writeAscii = (offset: number, value: string) => {
+    for (let index = 0; index < value.length; index += 1) view.setUint8(offset + index, value.charCodeAt(index));
+  };
+
+  writeAscii(0, "RIFF");
+  view.setUint32(4, 36 + pcm.byteLength, true);
+  writeAscii(8, "WAVE");
+  writeAscii(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, channels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * blockAlign, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, 16, true);
+  writeAscii(36, "data");
+  view.setUint32(40, pcm.byteLength, true);
+  wav.set(pcm, 44);
+  return wav;
+}
+
 function buildSpeechInstructions(input: { speaker?: string; tone?: string; includeSpeaker?: boolean }) {
   const parts: string[] = [];
   if (input.includeSpeaker !== false && input.speaker?.trim()) {
@@ -1226,6 +1401,17 @@ async function fetchProviderVoices(cfg: TTSConfig): Promise<TTSVoicesResponse> {
 export async function ttsRoutes(app: FastifyInstance) {
   const storage = createAppSettingsStorage(app.db);
   const connections = createConnectionsStorage(app.db);
+  // Config saves read the stored settings and write them back. Storage can hold a write
+  // (for example behind another request's transaction), so a save that read before
+  // another one landed would overwrite it. Run them one at a time instead.
+  // ponytail: in-process only, which covers the store's single writer process; any new
+  // read-modify-write of TTS_SETTINGS_KEY must go through this chain too.
+  let configWrites: Promise<unknown> = Promise.resolve();
+  const withConfigWriteLock = <T>(write: () => Promise<T>): Promise<T> => {
+    const run = configWrites.then(write);
+    configWrites = run.catch(() => undefined);
+    return run;
+  };
 
   /**
    * GET /api/tts/config
@@ -1234,7 +1420,9 @@ export async function ttsRoutes(app: FastifyInstance) {
   app.get("/config", async () => {
     const raw = await storage.get(TTS_SETTINGS_KEY);
     const cfg = parseStoredConfig(raw);
-    return maskTTSConfigForResponse(cfg);
+    // With an Audio connection chosen, every reader sees the adapter, address and model it speaks with.
+    const identity = await readChosenConnectionIdentity(connections, cfg.connectionId.trim());
+    return { ...maskTTSConfigForResponse(cfg), ...identity };
   });
 
   /**
@@ -1244,11 +1432,52 @@ export async function ttsRoutes(app: FastifyInstance) {
    */
   app.put("/config", async (req, reply) => {
     const input = ttsConfigSchema.parse(req.body);
-    const existing = parseStoredConfig(await storage.get(TTS_SETTINGS_KEY));
-    const storedConfig = prepareTTSConfigForStorage(input, existing);
-    clearPocketTtsApiModeCache(existing);
-    clearPocketTtsApiModeCache(storedConfig);
-    await storage.set(TTS_SETTINGS_KEY, JSON.stringify(storedConfig));
+    await withConfigWriteLock(async () => {
+      const existing = parseStoredConfig(await storage.get(TTS_SETTINGS_KEY));
+      const storedConfig = prepareTTSConfigForStorage(input, existing);
+      clearPocketTtsApiModeCache(existing);
+      clearPocketTtsApiModeCache(storedConfig);
+      await storage.set(TTS_SETTINGS_KEY, JSON.stringify(storedConfig));
+    });
+    return reply.status(204).send();
+  });
+
+  // Changes part of the stored settings and leaves everything else as stored. False when they cannot be read.
+  const updateStoredConfig = (change: (config: TTSConfig) => TTSConfig) =>
+    withConfigWriteLock(async () => {
+      const existing = readStoredConfig(await storage.get(TTS_SETTINGS_KEY));
+      // Settings this version cannot read (a newer version's, or edited by hand) stay as stored, not replaced by defaults.
+      if (!existing) return false;
+      // Keys stay exactly as stored (already encrypted); the active source profile mirrors the change, as on PUT /config.
+      await storage.set(TTS_SETTINGS_KEY, JSON.stringify(withActiveSourceProfile(change(existing))));
+      return true;
+    });
+  const UNREADABLE_SETTINGS = { error: "The saved Text to Speech settings could not be read." };
+
+  /**
+   * PUT /api/tts/config/voice-assignment
+   * Sets or clears one character's voice and leaves every other setting as stored,
+   * so a voice picked in the Character Editor cannot undo a newer settings save.
+   */
+  app.put("/config/voice-assignment", async (req, reply) => {
+    const { characterId, characterName, voice } = ttsVoiceAssignmentInputSchema.parse(req.body);
+    const saved = await updateStoredConfig((existing) => ({
+      ...existing,
+      voiceAssignments: setCharacterVoiceAssignment(existing.voiceAssignments, { characterId, characterName }, voice),
+    }));
+    if (!saved) return reply.status(409).send(UNREADABLE_SETTINGS);
+    return reply.status(204).send();
+  });
+
+  /**
+   * PUT /api/tts/config/voice-mode
+   * Switches between one shared voice and a voice per character and leaves every other setting
+   * as stored, so the Character Editor's "Use a voice per character" cannot undo a newer save.
+   */
+  app.put("/config/voice-mode", async (req, reply) => {
+    const { voiceMode } = ttsVoiceModeInputSchema.parse(req.body);
+    const saved = await updateStoredConfig((existing) => ({ ...existing, voiceMode }));
+    if (!saved) return reply.status(409).send(UNREADABLE_SETTINGS);
     return reply.status(204).send();
   });
 
@@ -1259,9 +1488,10 @@ export async function ttsRoutes(app: FastifyInstance) {
   app.get("/voices", async (req, reply) => {
     const { connectionId } = (req.query ?? {}) as { connectionId?: string };
     // Without an explicit connection this endpoint serves the TTS settings
-    // card, which edits the blob — resolving the default audio connection here
-    // would show the card voices for a source it is not configuring.
-    const cfg = connectionId ? await resolveAudioConfig(storage, connections, connectionId) : await loadConfig(storage);
+    // card — resolving the default audio connection here would show the card
+    // voices for a source it is not configuring.
+    const cfg = await resolveAudioConfig(storage, connections, connectionId || LEGACY_TTS_CONFIG_SENTINEL);
+    if (cfg.connectionUnavailable) return reply.status(409).send({ error: TTS_CONNECTION_UNAVAILABLE });
 
     try {
       return await fetchProviderVoices(cfg);
@@ -1283,7 +1513,8 @@ export async function ttsRoutes(app: FastifyInstance) {
    */
   app.get("/models", async (req, reply) => {
     const { connectionId } = (req.query ?? {}) as { connectionId?: string };
-    const cfg = connectionId ? await resolveAudioConfig(storage, connections, connectionId) : await loadConfig(storage);
+    const cfg = await resolveAudioConfig(storage, connections, connectionId || LEGACY_TTS_CONFIG_SENTINEL);
+    if (cfg.connectionUnavailable) return reply.status(409).send({ error: TTS_CONNECTION_UNAVAILABLE });
 
     try {
       return await fetchProviderModels(cfg);
@@ -1433,6 +1664,7 @@ export async function ttsRoutes(app: FastifyInstance) {
       context.key = canonicalTier;
     }
     const cfg = await resolveAudioConfig(storage, connections, audioConnectionId);
+    if (cfg.connectionUnavailable) return reply.status(409).send({ error: TTS_CONNECTION_UNAVAILABLE });
     const enabled = kind === "sfx" ? cfg.elevenLabsGameSoundEffects === true : cfg.elevenLabsGameMusic === true;
     if (cfg.source !== "elevenlabs" || !enabled) {
       return reply.status(400).send({ error: `ElevenLabs game ${kind} generation is not enabled` });
@@ -1474,6 +1706,10 @@ export async function ttsRoutes(app: FastifyInstance) {
 
     if (!cfg.enabled) {
       return reply.status(400).send({ error: "TTS is not enabled" });
+    }
+
+    if (cfg.connectionUnavailable) {
+      return reply.status(409).send({ error: TTS_CONNECTION_UNAVAILABLE });
     }
 
     if (cfg.source === "elevenlabs" && !cfg.apiKey) {
@@ -1599,7 +1835,9 @@ export async function ttsRoutes(app: FastifyInstance) {
                     response_format: audioFormat,
                     ...(speechInstructions ? { instructions: speechInstructions } : {}),
                   }),
-        signal: AbortSignal.timeout(60_000),
+        signal: AbortSignal.timeout(cfg.requestTimeoutMs),
+        // undici otherwise stops waiting after 300 s, whatever the limit above says.
+        agentOptions: { headersTimeout: cfg.requestTimeoutMs, bodyTimeout: cfg.requestTimeoutMs },
         policy: {
           allowLocal: allowLocalTtsUrl(cfg),
           allowedProtocols: ["https:", "http:"],
@@ -1609,10 +1847,22 @@ export async function ttsRoutes(app: FastifyInstance) {
         decodeCompressedResponse: cfg.source === "elevenlabs",
       });
     } catch (err: unknown) {
-      const msg =
-        err instanceof Error && err.name === "TimeoutError" ? "TTS request timed out" : "TTS provider unreachable";
+      if (err instanceof Error && err.name === "TimeoutError") {
+        const timeoutSeconds = cfg.requestTimeoutMs / 1000;
+        const setting = cfg.connectionName
+          ? `the "${cfg.connectionName}" audio connection`
+          : "Connections > Text to Speech";
+        logger.warn("TTS request timed out after %d s. Raise Request timeout in %s.", timeoutSeconds, setting);
+        // The client words this for the user from the code; `error` stays as before for anything else reading it.
+        return reply.status(502).send({
+          error: "TTS request timed out",
+          code: "tts_timeout",
+          timeoutSeconds,
+          connectionName: cfg.connectionName ?? null,
+        });
+      }
       req.log.error(err, "TTS provider request failed");
-      return reply.status(502).send({ error: msg });
+      return reply.status(502).send({ error: "TTS provider unreachable" });
     }
 
     if (!providerRes.ok) {
@@ -1623,7 +1873,7 @@ export async function ttsRoutes(app: FastifyInstance) {
     }
 
     const contentType = providerRes.headers.get("content-type");
-    let audioBuffer: ArrayBuffer;
+    let audioBuffer: ArrayBufferLike;
     try {
       audioBuffer = await providerRes.arrayBuffer();
     } catch (error: unknown) {
@@ -1631,9 +1881,75 @@ export async function ttsRoutes(app: FastifyInstance) {
       return reply.status(502).send({ error: "TTS provider response could not be read" });
     }
 
-    const responseContentType = resolveTTSAudioResponseContentType(contentType, new Uint8Array(audioBuffer));
+    const providerAudio = new Uint8Array(audioBuffer);
+    const declaredMime = contentType?.split(";", 1)[0]?.trim().toLowerCase();
+    const isRawPcm =
+      declaredMime === "audio/pcm" ||
+      (audioFormat === "pcm" && (!declaredMime || declaredMime === "application/octet-stream"));
+    if (isRawPcm) {
+      try {
+        // A provider may return a WAV container despite a PCM request/header. Never double-wrap it.
+        // Do not use generic MP3 sniffing here: FF FF is also a valid signed PCM sample (-1).
+        if (detectTTSAudioMimeType(providerAudio) === "audio/wav") {
+          const view = new DataView(providerAudio.buffer, providerAudio.byteOffset, providerAudio.byteLength);
+          let valid = view.getUint32(4, true) + 8 === providerAudio.byteLength;
+          let hasFormat = false;
+          let hasData = false;
+          let frameAlignment = 0;
+          let offset = 12;
+          // ponytail: check container bounds and fixed-frame layouts here; codec-specific validation stays with the browser decoder.
+          while (valid && offset < providerAudio.byteLength) {
+            if (offset + 8 > providerAudio.byteLength) {
+              valid = false;
+              break;
+            }
+            const chunkId = String.fromCharCode(...providerAudio.subarray(offset, offset + 4));
+            const size = view.getUint32(offset + 4, true);
+            const payloadOffset = offset + 8;
+            offset = payloadOffset + size + (size % 2);
+            valid = offset <= providerAudio.byteLength;
+            if (chunkId === "fmt ") {
+              valid &&= !hasFormat;
+              hasFormat = size >= 16;
+              valid &&= hasFormat;
+              if (valid) {
+                const formatTag = view.getUint16(payloadOffset, true);
+                const channels = view.getUint16(payloadOffset + 2, true);
+                const sampleRate = view.getUint32(payloadOffset + 4, true);
+                const blockAlign = view.getUint16(payloadOffset + 12, true);
+                const bitsPerSample = view.getUint16(payloadOffset + 14, true);
+                if (formatTag === 1 || formatTag === 3) frameAlignment = blockAlign;
+                // Compressed WAV formats can legitimately report zero bits per sample.
+                valid =
+                  channels > 0 &&
+                  sampleRate > 0 &&
+                  ((formatTag !== 1 && formatTag !== 3) ||
+                    (bitsPerSample > 0 &&
+                      blockAlign * 8 === channels * bitsPerSample &&
+                      view.getUint32(payloadOffset + 8, true) === sampleRate * blockAlign));
+              }
+            } else if (chunkId === "data") {
+              hasData = size > 0;
+              valid &&= hasData && hasFormat && (frameAlignment === 0 || size % frameAlignment === 0);
+            }
+          }
+          if (!valid || !hasFormat || !hasData) {
+            throw new Error("TTS provider returned malformed WAV audio");
+          }
+        } else {
+          audioBuffer = wrapTTSPcm16AsWav(providerAudio, resolveTTSPcmFormat(contentType, base)).buffer;
+        }
+      } catch (error: unknown) {
+        return reply.status(502).send({
+          error: "TTS provider returned invalid PCM audio",
+          detail: error instanceof Error ? error.message : "Unknown PCM error",
+        });
+      }
+    }
+
+    const responseContentType = isRawPcm ? "audio/wav" : resolveTTSAudioResponseContentType(contentType, providerAudio);
     if (!responseContentType) {
-      const body = new TextDecoder().decode(audioBuffer);
+      const body = new TextDecoder().decode(providerAudio);
       return reply.status(502).send({
         error: "TTS provider returned a non-audio response",
         detail: readProviderErrorDetail(body) || `Content-Type: ${contentType || "missing"}`,

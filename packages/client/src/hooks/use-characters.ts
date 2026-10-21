@@ -25,6 +25,7 @@ import { achievementKeys, trackAchievementEvent } from "./use-achievements";
 import { cleanTrackerCardColorConfig } from "../lib/tracker-card-colors";
 import { personaCacheKeys, syncCachedPersona } from "../lib/persona-cache";
 import {
+  GREETING_IMAGE_BAKE_MAX_PER_REQUEST,
   PROFESSOR_MARI_ID,
   type CharacterData,
   type CharacterCatalogEntry,
@@ -91,11 +92,8 @@ type UseCharactersOptions =
       includeBuiltIn?: boolean;
     };
 
-export function useCharacters(options: UseCharactersOptions = true) {
-  const enabled = typeof options === "boolean" ? options : (options.enabled ?? true);
-  const includeBuiltIn = typeof options === "object" ? options.includeBuiltIn === true : false;
-
-  return useQuery({
+function characterListQuery(includeBuiltIn: boolean) {
+  return {
     queryKey: includeBuiltIn ? characterKeys.listWithBuiltIns() : characterKeys.list(),
     queryFn: async () => {
       const characters = await api.get<Array<{ id?: unknown }>>(
@@ -104,9 +102,15 @@ export function useCharacters(options: UseCharactersOptions = true) {
       if (includeBuiltIn) return characters;
       return characters.filter((character) => character.id !== PROFESSOR_MARI_ID);
     },
-    enabled,
     staleTime: 5 * 60_000,
-  });
+  };
+}
+
+export function useCharacters(options: UseCharactersOptions = true) {
+  const enabled = typeof options === "boolean" ? options : (options.enabled ?? true);
+  const includeBuiltIn = typeof options === "object" ? options.includeBuiltIn === true : false;
+
+  return useQuery({ ...characterListQuery(includeBuiltIn), enabled });
 }
 
 export function useCharacterPages(options: {
@@ -923,6 +927,35 @@ export function useUploadCharacterGalleryImage(characterId: string) {
   });
 }
 
+export type GreetingImageBakeResult = { url: string; file?: string; error?: string };
+
+/** Downloads web images into the character gallery, a few per request; a failed request fails only its own images. */
+export function useBakeCharacterGalleryImages(characterId: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (urls: string[]) => {
+      const results: GreetingImageBakeResult[] = [];
+      for (let start = 0; start < urls.length; start += GREETING_IMAGE_BAKE_MAX_PER_REQUEST) {
+        const batch = urls.slice(start, start + GREETING_IMAGE_BAKE_MAX_PER_REQUEST);
+        try {
+          const response = await api.post<{ results: GreetingImageBakeResult[] }>(
+            `/characters/${characterId}/gallery/bake`,
+            { urls: batch },
+          );
+          results.push(...response.results);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          results.push(...batch.map((url) => ({ url, error: message })));
+        }
+      }
+      return results;
+    },
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: characterKeys.gallery(characterId) });
+    },
+  });
+}
+
 export function useDeleteCharacterGalleryImage(characterId: string) {
   const qc = useQueryClient();
   return useMutation({
@@ -1140,13 +1173,22 @@ function invalidatePersonaVersions(qc: QueryClient, id: string) {
   return qc.invalidateQueries({ queryKey: characterKeys.personaVersions(id), exact: true });
 }
 
+const personaListQuery = {
+  queryKey: characterKeys.personas,
+  queryFn: () => api.get<Persona[]>("/characters/personas/list"),
+  staleTime: 5 * 60_000,
+};
+
 export function usePersonas(enabled = true) {
-  return useQuery({
-    queryKey: characterKeys.personas,
-    queryFn: () => api.get<Persona[]>("/characters/personas/list"),
-    enabled,
-    staleTime: 5 * 60_000,
-  });
+  return useQuery({ ...personaListQuery, enabled });
+}
+
+/**
+ * Waits for the character and persona lists while they are still loading (right after the page
+ * opens), so a sent message fills {{char}} and {{user}} with real names, not "Character" and "User".
+ */
+export async function ensureCharacterAndPersonaLists(qc: QueryClient) {
+  await Promise.allSettled([qc.ensureQueryData(characterListQuery(false)), qc.ensureQueryData(personaListQuery)]);
 }
 
 export function usePersonaPages(options: { enabled?: boolean; search?: string; sort?: string }) {
@@ -1403,5 +1445,38 @@ export function useDeletePersonaGroup() {
   return useMutation({
     mutationFn: (id: string) => api.delete(`/characters/persona-groups/${id}`),
     onSuccess: () => qc.invalidateQueries({ queryKey: characterKeys.personaGroups }),
+  });
+}
+
+// ── Library maintenance: bulk tags ──
+
+export function useBulkEditCharacterTags() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (input: {
+      ids: string[];
+      add?: string[];
+      remove?: string[];
+      rename?: Array<{ from: string; to: string }>;
+    }) => {
+      const merged = { updatedIds: [] as string[], unchangedIds: [] as string[], failedIds: [] as string[] };
+      for (let start = 0; start < input.ids.length; start += 5000) {
+        const ids = input.ids.slice(start, start + 5000);
+        try {
+          const result = await api.post<typeof merged>("/characters/bulk-tags", { ...input, ids });
+          merged.updatedIds.push(...result.updatedIds);
+          merged.unchangedIds.push(...result.unchangedIds);
+          merged.failedIds.push(...result.failedIds);
+        } catch {
+          merged.failedIds.push(...ids);
+        }
+      }
+      return merged;
+    },
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: characterKeys.list() });
+      qc.invalidateQueries({ queryKey: characterKeys.summariesRoot() });
+      qc.invalidateQueries({ queryKey: [...characterKeys.all, "detail"] });
+    },
   });
 }

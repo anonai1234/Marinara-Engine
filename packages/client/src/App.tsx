@@ -8,7 +8,9 @@ import {
   Suspense,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
+  useRef,
   useState,
   type CSSProperties,
   type ErrorInfo,
@@ -22,6 +24,7 @@ import { PersonalExtensionInjector } from "./components/layout/PersonalExtension
 import { ModelDownloadModal } from "./components/modals/ModelDownloadModal";
 import { WhatsNewModal } from "./components/modals/WhatsNewModal";
 import { StorageMigrationNoticeModal } from "./components/modals/StorageMigrationNoticeModal";
+import { SeasonalGreetingModal } from "./components/modals/SeasonalGreetingModal";
 import { AppDialogRenderer } from "./components/ui/AppDialogRenderer";
 import { ChibiProfessorMariEasterEgg } from "./components/ui/ChibiProfessorMariEasterEgg";
 import { CsrfOriginWarningBanner } from "./components/diagnostics/CsrfOriginWarningBanner";
@@ -31,6 +34,7 @@ import {
   getDefaultAppAccentColor,
   getDefaultAppBackgroundColor,
   getDefaultChatChromeTextColor,
+  isMobileShellViewport,
   MOBILE_SHELL_MEDIA_QUERY,
   useUIStore,
 } from "./stores/ui.store";
@@ -40,6 +44,7 @@ import { api, requestTimeoutSignal } from "./lib/api-client";
 import { forceRefreshSpa, reloadBrowser } from "./lib/browser-runtime";
 import { recordClientError } from "./lib/client-runtime-diagnostics";
 import { showAppUpdatePrompt } from "./lib/app-update-prompt";
+import { UI_PERSISTENCE_HOST_COPY } from "./lib/ui-persistence";
 import { formatRuntimeBuild, getServerRuntimeBuild, isRuntimeBuildCurrent } from "./lib/runtime-build";
 import {
   getCssColorFallback,
@@ -48,15 +53,23 @@ import {
   RAINBOW_GRADIENT_PRESET,
 } from "./lib/css-colors";
 import { normalizeThemeCss } from "./lib/theme-css";
+import {
+  CHAT_WIDGET_COLOR_PROPERTIES,
+  getChatWidgetColorRoles,
+  getChatWidgetColorStyle,
+} from "./lib/chat-widget-colors";
+import { getChatWidgetFontFamily, stripFontFamilyQuotes, toCssFontFamilyValue } from "./lib/font-family";
 import { useLegacyThemeMigration, useThemes } from "./hooks/use-themes";
 import { useSettingsSync } from "./hooks/use-settings-sync";
 import { useStorageMigrationNotice } from "./hooks/use-storage-migration-notice";
+import { useSeasonalTheme } from "./hooks/use-seasonal-theme";
 import { useCustomNotificationSoundStatus } from "./hooks/use-custom-notification-sound";
 import { useReducedAmbientEffects } from "./hooks/use-reduced-ambient-effects";
 import { installLongTaskWarner } from "./lib/perf-diagnostics";
 import { getStoreBackLayers } from "./lib/back-layers";
 import { initBackNavigation, syncBackNavigation } from "./lib/back-navigation";
 import { setCustomNotificationSoundUrl } from "./lib/notification-sound";
+import { PHONE_TOAST_TOP_VARIABLE, watchPhoneToastTop } from "./lib/phone-toast-top";
 
 const VERSION_CHECK_INTERVAL_MS = 5 * 60_000;
 // Against a frozen host the connection opens but is never answered; without a
@@ -159,6 +172,7 @@ export class AppRecoveryBoundary extends Component<{ children: ReactNode }, { er
   private resetLocalUiState = () => {
     try {
       window.localStorage.removeItem("marinara-engine-ui");
+      window.localStorage.removeItem(UI_PERSISTENCE_HOST_COPY);
       window.localStorage.removeItem("marinara-active-chat-id");
       window.localStorage.removeItem("marinara-input-drafts");
       window.sessionStorage.removeItem("marinara-input-drafts");
@@ -212,23 +226,6 @@ export class AppRecoveryBoundary extends Component<{ children: ReactNode }, { er
       </Translation>
     );
   }
-}
-
-function stripFontFamilyQuotes(family: string): string {
-  const trimmed = family.trim();
-  if (trimmed.length < 2) return trimmed;
-
-  const quote = trimmed[0];
-  if ((quote !== `"` && quote !== `'`) || trimmed[trimmed.length - 1] !== quote) {
-    return trimmed;
-  }
-
-  return trimmed.slice(1, -1).trim();
-}
-
-function toCssFontFamilyValue(family: string): string {
-  const cleanFamily = stripFontFamilyQuotes(family);
-  return `"${cleanFamily.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
 function customFontFaceKey(family: string, font: CustomFontFace): string {
@@ -401,7 +398,7 @@ function getThemeAccentPulseConfig(css: string | null | undefined) {
 
   return {
     enabled,
-    source: enabled ? getFirstThemeAccentSource(normalizedCss) : "",
+    source: getFirstThemeAccentSource(normalizedCss),
   };
 }
 
@@ -487,11 +484,23 @@ export function App() {
   useRefreshLocalContext();
   const theme = useUIStore((s) => s.theme);
   const notificationPosition = useUIStore((s) => s.notificationPosition);
+  const omnibarOpen = useUIStore((s) => s.omnibarOpen);
+  const [isMobileShell, setIsMobileShell] = useState(isMobileShellViewport);
   const isLite = import.meta.env.VITE_MARINARA_LITE === "true";
   const fontSize = useUIStore((s) => s.fontSize);
   const language = useUIStore((s) => s.language);
   const visualTheme = useUIStore((s) => s.visualTheme);
   const fontFamily = useUIStore((s) => s.fontFamily);
+  const chatWidgetPreset = useUIStore((s) => s.chatWidgetPreset);
+  const chatWidgetFont = useUIStore((s) => s.chatWidgetFont);
+  const chatWidgetShape = useUIStore((s) => s.chatWidgetShape);
+  const chatWidgetButtonSize = useUIStore((s) => s.chatWidgetButtonSize);
+  const chatWidgetBorderColor = useUIStore((s) => s.chatWidgetBorderColor);
+  const chatWidgetBackgroundColor = useUIStore((s) => s.chatWidgetBackgroundColor);
+  const chatWidgetTextColor = useUIStore((s) => s.chatWidgetTextColor);
+  const chatWidgetApplyFont = useUIStore((s) => s.chatWidgetApplyFont);
+  const chatWidgetApplyShape = useUIStore((s) => s.chatWidgetApplyShape);
+  const chatWidgetApplyColors = useUIStore((s) => s.chatWidgetApplyColors);
   const appBackgroundColor = useUIStore((s) => s.appBackgroundColor);
   const appAccentColor = useUIStore((s) => s.appAccentColor);
   const appAccentPulseMode = useUIStore((s) => s.appAccentPulseMode);
@@ -519,6 +528,12 @@ export function App() {
   const hasAppDialogOpen = useDialogStore((s) => s.dialog !== null);
   const [whatsNewOpen, setWhatsNewOpen] = useState(false);
   const [whatsNewResolved, setWhatsNewResolved] = useState(false);
+  const [agentUpdateOpen, setAgentUpdateOpen] = useState(false);
+  const [agentUpdatesResolved, setAgentUpdatesResolved] = useState(false);
+  const handleAgentUpdatesResolved = useCallback(() => setAgentUpdatesResolved(true), []);
+  const [chatWindowIntroOpen, setChatWindowIntroOpen] = useState(false);
+  const seasonal = useSeasonalTheme();
+  const [seasonalGreetingOpen, setSeasonalGreetingOpen] = useState(false);
   const handleWhatsNewResolved = useCallback(() => setWhatsNewResolved(true), []);
   // Shares the modal's query via the cache; gating the prompter on the QUERY
   // (pending or a notice still waiting) instead of the modal's open state
@@ -534,6 +549,31 @@ export function App() {
   useEffect(() => {
     installLongTaskWarner();
   }, []);
+
+  // While the omnibar is open the toast moves to bottom-right on desktop and to the top, under the
+  // omnibar header, on the mobile shell (N3, slice 46), so it covers neither the search field nor Mari's
+  // composer; same viewport check AppShell uses for layout decisions.
+  useEffect(() => {
+    const mq = window.matchMedia(MOBILE_SHELL_MEDIA_QUERY);
+    const handler = () => setIsMobileShell(isMobileShellViewport());
+    mq.addEventListener("change", handler);
+    window.addEventListener("resize", handler);
+    return () => {
+      mq.removeEventListener("change", handler);
+      window.removeEventListener("resize", handler);
+    };
+  }, []);
+
+  // A phone toast sits below the header rows at the top, never over their controls (lib/phone-toast-top).
+  const toasterHostRef = useRef<HTMLDivElement>(null);
+  const phoneToastsAtTop = isMobileShell && (omnibarOpen || notificationPosition !== "bottom");
+  const phoneToastOffsetTop = omnibarOpen
+    ? "calc(env(safe-area-inset-top) + 5rem)"
+    : `max(calc(env(safe-area-inset-top) + 3.5rem), var(${PHONE_TOAST_TOP_VARIABLE}, 0px))`;
+  useLayoutEffect(() => {
+    if (!phoneToastsAtTop || !toasterHostRef.current) return;
+    return watchPhoneToastTop(toasterHostRef.current);
+  }, [phoneToastsAtTop]);
 
   // Hardware / gesture back dismisses the topmost overlay instead of exiting.
   useEffect(() => {
@@ -640,16 +680,47 @@ export function App() {
       // background-color, not from resolved custom properties (see index.html).
       // Read the rendered variable so visual themes and injected custom theme
       // CSS are reflected instead of falling back to the stock scheme.
-      const computedBackground = getComputedStyle(root).getPropertyValue("--background").trim();
-      const literalBackground = getCssColorFallback(computedBackground, resolvedBackground);
+      const computedStyle = getComputedStyle(root);
+      const computedBackground = computedStyle.getPropertyValue("--background").trim();
+      let literalBackground = getCssColorFallback(computedBackground, resolvedBackground);
+      // Flatten translucent shell surfaces over the app background. Browser
+      // chrome needs an opaque color, and sidebars retain the Home menu surface.
+      const canvas = document.createElement("canvas");
+      canvas.width = canvas.height = 1;
+      const context = canvas.getContext("2d");
+      // WebKit can refuse canvas reads under memory pressure (InvalidStateError);
+      // keep the unflattened color then instead of crashing the app shell.
+      if (context) {
+        try {
+          context.fillStyle = defaultBackground;
+          context.fillRect(0, 0, 1, 1);
+          context.fillStyle = literalBackground;
+          context.fillRect(0, 0, 1, 1);
+          const backgroundPixels = context.getImageData(0, 0, 1, 1);
+          context.fillStyle = computedStyle.getPropertyValue("--card").trim();
+          context.fillRect(0, 0, 1, 1);
+          const [red, green, blue] = context.getImageData(0, 0, 1, 1).data;
+          const shellSurface = `rgb(${red}, ${green}, ${blue})`;
+          root.style.setProperty("--marinara-shell-surface", shellSurface);
+          context.putImageData(backgroundPixels, 0, 0);
+          context.fillStyle = computedStyle.getPropertyValue("--marinara-topbar-surface").trim();
+          context.fillRect(0, 0, 1, 1);
+          const [topbarRed, topbarGreen, topbarBlue] = context.getImageData(0, 0, 1, 1).data;
+          literalBackground = `rgb(${topbarRed}, ${topbarGreen}, ${topbarBlue})`;
+        } catch (error) {
+          console.warn("[theme] Could not read the canvas to flatten the page backing", error);
+        }
+      }
+      root.style.setProperty("--marinara-page-backing", literalBackground);
       root.style.setProperty("background-color", literalBackground, "important");
       document.body.style.setProperty("background-color", literalBackground, "important");
+      document.querySelector('meta[name="theme-color"]')?.setAttribute("content", literalBackground);
     };
 
     syncLiteralBackground();
     const frame = requestAnimationFrame(syncLiteralBackground);
     return () => cancelAnimationFrame(frame);
-  }, [activeCustomTheme?.css, appBackgroundColor, theme, visualTheme]);
+  }, [activeCustomTheme?.css, appBackgroundColor, seasonal.themeId, theme, visualTheme]);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -687,7 +758,7 @@ export function App() {
     const accent = appAccentColor.trim();
     const defaultAccent = getDefaultAppAccentColor();
     const defaultSolidAccent = getCssColorFallback(defaultAccent, "currentColor");
-    const accentSource = themeAccentPulseConfig.source || accent || defaultAccent;
+    const accentSource = accent || themeAccentPulseConfig.source || defaultAccent;
     const solidAccent = getCssColorFallback(accentSource, defaultSolidAccent);
     const accentIsGradient = isCssGradient(accentSource);
     const animatedAccentSource = appAccentRgbMode ? RAINBOW_GRADIENT_PRESET : accentSource;
@@ -942,6 +1013,12 @@ export function App() {
     }
   }, [visualTheme]);
 
+  // Seasonal look of the day (styles/themes/seasonal-*.css), layered over every theme until it ends.
+  useEffect(() => {
+    if (seasonal.themeId) document.documentElement.dataset.seasonalTheme = seasonal.themeId;
+    else delete document.documentElement.dataset.seasonalTheme;
+  }, [seasonal.themeId]);
+
   useEffect(() => {
     document.documentElement.style.fontSize = `${fontSize}px`;
   }, [fontSize]);
@@ -1015,12 +1092,74 @@ export function App() {
   // Apply custom font family via CSS variable
   useEffect(() => {
     const family = fontFamily ? stripFontFamilyQuotes(fontFamily) : "";
+    const rootStyle = document.documentElement.style;
     if (family) {
-      document.documentElement.style.setProperty("--font-user", toCssFontFamilyValue(family));
+      rootStyle.setProperty("--font-user", toCssFontFamilyValue(family));
+      // Prompt fields (mari-prompt-font) stay monospace until a font is picked, then use the full app stack.
+      rootStyle.setProperty("--font-prompt", "var(--font-y2k)");
     } else {
-      document.documentElement.style.removeProperty("--font-user");
+      rootStyle.removeProperty("--font-user");
+      rootStyle.removeProperty("--font-prompt");
     }
   }, [fontFamily]);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    if (chatWidgetPreset === "default") delete root.dataset.chatWidgetPreset;
+    else root.dataset.chatWidgetPreset = chatWidgetPreset;
+    const shape =
+      chatWidgetShape !== "preset"
+        ? chatWidgetShape
+        : chatWidgetPreset === "dottore"
+          ? "cut-corner"
+          : chatWidgetPreset === "mari"
+            ? "arched"
+            : null;
+    if (shape) root.dataset.chatWidgetShape = shape;
+    else delete root.dataset.chatWidgetShape;
+    const font = getChatWidgetFontFamily(chatWidgetFont);
+    if (font) root.style.setProperty("--mari-widget-font-override", font);
+    else root.style.removeProperty("--mari-widget-font-override");
+  }, [chatWidgetPreset, chatWidgetFont, chatWidgetShape]);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    if (chatWidgetButtonSize === null) {
+      delete root.dataset.chatWidgetButtonSize;
+      root.style.removeProperty("--mari-window-bubble-size");
+    } else {
+      root.dataset.chatWidgetButtonSize = String(chatWidgetButtonSize);
+      root.style.setProperty("--mari-window-bubble-size", `${chatWidgetButtonSize}px`);
+    }
+  }, [chatWidgetButtonSize]);
+
+  useEffect(() => {
+    const colors = getChatWidgetColorStyle({
+      border: chatWidgetBorderColor,
+      background: chatWidgetBackgroundColor,
+      text: chatWidgetTextColor,
+    });
+    const roles = getChatWidgetColorRoles(colors);
+    if (roles) document.documentElement.dataset.chatWidgetColors = roles;
+    else delete document.documentElement.dataset.chatWidgetColors;
+    for (const property of CHAT_WIDGET_COLOR_PROPERTIES) {
+      const value = colors[property];
+      if (value) document.documentElement.style.setProperty(property, value);
+      else document.documentElement.style.removeProperty(property);
+    }
+  }, [chatWidgetBorderColor, chatWidgetBackgroundColor, chatWidgetTextColor]);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    for (const [attribute, enabled] of [
+      ["data-chat-widget-apply-font", chatWidgetApplyFont],
+      ["data-chat-widget-apply-shape", chatWidgetApplyShape],
+      ["data-chat-widget-apply-colors", chatWidgetApplyColors],
+    ] as const) {
+      if (enabled) root.setAttribute(attribute, "true");
+      else root.removeAttribute(attribute);
+    }
+  }, [chatWidgetApplyFont, chatWidgetApplyShape, chatWidgetApplyColors]);
 
   // Register custom font faces without forcing every shard to load at startup.
   const { data: customFonts } = useQuery<CustomFontFace[]>({
@@ -1074,7 +1213,21 @@ export function App() {
       <PersonalExtensionInjector />
       <ChibiProfessorMariEasterEgg />
       <Suspense fallback={null}>
-        <LazyAppShell />
+        <LazyAppShell
+          chatWindowIntroAllowed={
+            whatsNewResolved &&
+            !hasModalOpen &&
+            !hasAppDialogOpen &&
+            !whatsNewOpen &&
+            !migrationNoticePending &&
+            !migrationNotice &&
+            agentUpdatesResolved &&
+            !agentUpdateOpen &&
+            !seasonalGreetingOpen &&
+            (isLite || !showDownloadModal)
+          }
+          onChatWindowIntroOpenChange={setChatWindowIntroOpen}
+        />
       </Suspense>
       <WhatsNewModal
         presentationAllowed={!hasModalOpen && !hasAppDialogOpen && (isLite || !showDownloadModal)}
@@ -1087,6 +1240,8 @@ export function App() {
         }
       />
       <AgentUpdatePrompter
+        onOpenChange={setAgentUpdateOpen}
+        onResolved={handleAgentUpdatesResolved}
         presentationAllowed={
           whatsNewResolved &&
           !hasModalOpen &&
@@ -1094,6 +1249,27 @@ export function App() {
           !whatsNewOpen &&
           !migrationNoticePending &&
           !migrationNotice &&
+          !chatWindowIntroOpen &&
+          !seasonalGreetingOpen &&
+          (isLite || !showDownloadModal)
+        }
+      />
+      <SeasonalGreetingModal
+        themeId={seasonal.themeId}
+        pending={seasonal.showGreeting}
+        onShown={seasonal.markGreeted}
+        onTurnOff={seasonal.turnOff}
+        onOpenChange={setSeasonalGreetingOpen}
+        presentationAllowed={
+          whatsNewResolved &&
+          !hasModalOpen &&
+          !hasAppDialogOpen &&
+          !whatsNewOpen &&
+          !migrationNoticePending &&
+          !migrationNotice &&
+          agentUpdatesResolved &&
+          !agentUpdateOpen &&
+          !chatWindowIntroOpen &&
           (isLite || !showDownloadModal)
         }
       />
@@ -1106,6 +1282,15 @@ export function App() {
       <AppDialogRenderer />
       <CsrfOriginWarningBanner />
       <div
+        ref={toasterHostRef}
+        // Sonner slides top toasts upward and extends their hover area above the visible box.
+        // Clip both at the header edge so they cannot intercept its controls, even during motion.
+        className={
+          phoneToastsAtTop
+            ? "pointer-events-none fixed inset-0 z-[999999999] [&_[data-sonner-toast]]:pointer-events-auto"
+            : undefined
+        }
+        style={phoneToastsAtTop ? { clipPath: `inset(max(0px, calc(${phoneToastOffsetTop} - 8px)) 0 0 0)` } : undefined}
         // Interacting with a toast (including its close button) must not count
         // as an outside click for chat floating panels — otherwise dismissing
         // a toast closes the settings/gallery drawer (and any modal inside it).
@@ -1118,9 +1303,37 @@ export function App() {
         }}
       >
         <Toaster
-          position={notificationPosition === "bottom" ? "bottom-center" : "top-center"}
-          swipeDirections={["left", "right", notificationPosition === "bottom" ? "bottom" : "top"]}
-          offset="4rem"
+          position={
+            omnibarOpen
+              ? isMobileShell
+                ? "top-center"
+                : "bottom-right"
+              : notificationPosition === "bottom"
+                ? "bottom-center"
+                : "top-center"
+          }
+          swipeDirections={[
+            "left",
+            "right",
+            omnibarOpen ? (isMobileShell ? "top" : "bottom") : notificationPosition === "bottom" ? "bottom" : "top",
+          ]}
+          // Sonner's mobileOffset applies only up to 600px; wider touch shells and phone landscape
+          // need the same clearance without changing desktop placement or bottom notifications.
+          offset={{
+            top: phoneToastsAtTop ? phoneToastOffsetTop : "4rem",
+            bottom: "4rem",
+            left: "4rem",
+            right: "4rem",
+          }}
+          mobileOffset={{
+            // On the mobile omnibar the toast sits under the omnibar's own header
+            // (search field + status row) instead of the app's top bar, so it
+            // needs more clearance than the app-shell top offset below. Elsewhere
+            // it sits below the window, editor, panel or chat header rows, and
+            // never higher than under the top bar.
+            top: phoneToastOffsetTop,
+            bottom: "1rem",
+          }}
           theme={theme}
           closeButton
           duration={TOAST_DURATION_MS}

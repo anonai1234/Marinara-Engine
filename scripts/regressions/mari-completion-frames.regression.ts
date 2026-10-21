@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { promises as dns } from "node:dns";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,6 +11,10 @@ process.env.FILE_STORAGE_DIR = storageDir;
 const { getDB, closeDB } = await import("../../packages/server/src/db/connection.js");
 try {
   const db = await getDB();
+  // This fixture exercises the Classic JSON-frame protocol explicitly.
+  const { createAppSettingsStorage } =
+    await import("../../packages/server/src/services/storage/app-settings.storage.js");
+  await createAppSettingsStorage(db).set("mari-runtime", "classic");
   const { ProfessorMariWorkspaceService, professorMariWorkspaceResponseFormat } =
     await import("../../packages/server/src/services/professor-mari/workspace-agent.service.js");
   const { MariDbService } = await import("../../packages/server/src/services/mari-db/mari-db.service.js");
@@ -101,6 +106,10 @@ try {
   }
   // Exercise the actual Gemini adapter and Mari repair loop, with no external requests.
   const originalFetch = globalThis.fetch;
+  // The outbound-URL guard resolves the Gemini host before the mocked fetch; a slow resolver
+  // (glibc retries a dropped query after 5 s) pushed this file past the runner's 30 s budget.
+  const originalLookup = dns.lookup;
+  dns.lookup = (async () => [{ address: "93.184.216.34", family: 4 }]) as unknown as typeof dns.lookup;
   try {
     for (const provider of ["google", "google_vertex"] as const) {
       for (const stream of [false, true]) {
@@ -121,7 +130,7 @@ try {
               id: `gemini-${provider}-${stream}-${scenario}`,
               name: "Gemini fixture",
               provider,
-              model: "gemini-3.8-flash",
+              model: "gemini-3.8-flash-uncatalogued-fixture",
               baseUrl:
                 provider === "google"
                   ? "https://generativelanguage.googleapis.com"
@@ -141,7 +150,7 @@ try {
               manualApprovalArmed: false,
             }),
             baseChatOptions: (_connection: unknown, signal: AbortSignal) => ({
-              model: "gemini-3.8-flash",
+              model: "gemini-3.8-flash-uncatalogued-fixture",
               maxTokens: 2048,
               maxContext: 8192,
               stream,
@@ -268,6 +277,7 @@ try {
     }
   } finally {
     globalThis.fetch = originalFetch;
+    dns.lookup = originalLookup;
   }
   console.log("Mari mixed completion frames preserve edits and permission boundaries.");
 } finally {

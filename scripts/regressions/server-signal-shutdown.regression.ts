@@ -2,7 +2,7 @@
 // server even with a TTY, and duplicate terminal signals must not cut off close.
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import { createConnection, createServer } from "node:net";
@@ -25,6 +25,7 @@ if (process.platform === "win32") {
       "powershell.exe",
       [
         "-NoProfile",
+        "-NonInteractive",
         "-ExecutionPolicy",
         "Bypass",
         "-File",
@@ -40,6 +41,15 @@ if (process.platform === "win32") {
       ],
       { stdio: "inherit", timeout: 45_000 },
     );
+  } catch (error) {
+    for (const name of ["progress.log", "stdout.log", "stderr.log"]) {
+      try {
+        process.stderr.write(`Windows console fixture ${name}:\n${readFileSync(join(dir, name), "utf8")}\n`);
+      } catch {
+        // A failure before process creation may leave no redirected output.
+      }
+    }
+    throw error;
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -82,7 +92,9 @@ child.stderr.on("data", (chunk) => {
   output += chunk;
 });
 const exited = new Promise<number | null>((done) => child.once("exit", done));
-const deadline = setTimeout(() => child.kill("SIGKILL"), 20_000);
+// Match the restart fixture's cold native-CI boot allowance without relaxing shutdown checks.
+const startupTimeout = 60_000;
+let deadline = setTimeout(() => child.kill("SIGKILL"), startupTimeout);
 let serverPid: number | undefined;
 let socket: ReturnType<typeof createConnection> | undefined;
 async function waitFor(predicate: () => boolean, timeout = 8_000) {
@@ -92,7 +104,9 @@ async function waitFor(predicate: () => boolean, timeout = 8_000) {
   assert.ok(predicate(), output);
 }
 try {
-  await waitFor(() => output.includes("Marinara Engine server listening"));
+  await waitFor(() => output.includes("Marinara Engine server listening"), startupTimeout);
+  clearTimeout(deadline);
+  deadline = setTimeout(() => child.kill("SIGKILL"), 20_000);
   const readyLine = output.split("\n").find((line) => line.includes("Marinara Engine server listening"))!;
   serverPid = JSON.parse(readyLine).pid;
   assert.ok(serverPid);
@@ -142,7 +156,7 @@ for (const nodeEnv of ["production", "development"]) {
         mode,
         nodeEnv,
       ],
-      { stdio: "inherit", timeout: 40_000 },
+      { stdio: "inherit", timeout: 50_000 },
     );
   }
 }

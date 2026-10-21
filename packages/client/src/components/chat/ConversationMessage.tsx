@@ -1,12 +1,14 @@
+import { ConversationSceneInvitation } from "./ConversationSceneInvitation";
 import { useMessagePresetVariables } from "../../hooks/use-message-preset-variables";
 // ──────────────────────────────────────────────
 // Chat: Conversation message shell
 // Resolves character/persona identity, builds render context,
 // and delegates to the appropriate layout component.
 // ──────────────────────────────────────────────
-import { useState, useCallback, useRef, useEffect, memo, useMemo, type CSSProperties } from "react";
+import { useState, useCallback, useRef, useEffect, memo, useMemo, type CSSProperties, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { Phone, PhoneIncoming, PhoneOff, Trash2 } from "lucide-react";
+import { ChatImageLightbox } from "./ChatImageLightbox";
+import { AlertTriangle, Phone, PhoneIncoming, PhoneOff, Trash2 } from "lucide-react";
 import { useQueryClient, type InfiniteData } from "@tanstack/react-query";
 import {
   formatTextQuotes,
@@ -28,6 +30,7 @@ import { useChatGalleryFilenameIndex } from "../../hooks/use-characters";
 import type { CharacterMap, MessageSelectionToggle, PersonaInfo } from "./chat-area.types";
 import { MESSAGE_SELECTION_SURFACE_CLASS } from "./message-selection-styles";
 import { GenerationReplayDetailsModal, hasGenerationReplayDetails } from "./GenerationReplayDetailsModal";
+import { GenerationFallbackMarker } from "./GenerationFallbackMarker";
 import {
   HiddenFromAIConversationButton,
   ConversationMessageLightbox,
@@ -37,6 +40,7 @@ import {
 } from "./ConversationMessageShared";
 import { MessageReplyPreview } from "./MessageReplyPreview";
 import { ConversationMessageActions } from "./ConversationMessageActions";
+import { MessageMarkIndicators } from "./MessageMarks";
 import { ConversationMessageGrouped } from "./ConversationMessageGrouped";
 import { ConversationMessageBubble } from "./ConversationMessageBubble";
 import { ConversationMessageLine } from "./ConversationMessageLine";
@@ -99,6 +103,12 @@ interface ConversationMessageProps {
   onDelete?: (messageId: string) => void;
   onRegenerate?: (messageId: string) => void;
   onEdit?: (messageId: string, content: string) => void;
+  /** N1: this message's reply failed — renders the quiet "Failed · Retry" line. */
+  failedReply?: boolean;
+  failedReplyReason?: string;
+  onRetryFailedReply?: () => void;
+  /** R2: the reply checkup's quiet line, set only on the reply it describes. */
+  replyCheckup?: ReactNode;
   onSetActiveSwipe?: (messageId: string, index: number) => void;
   onToggleHiddenFromAI?: (messageId: string, current: boolean) => void;
   onPeekPrompt?: () => void;
@@ -141,6 +151,10 @@ export const ConversationMessage = memo(function ConversationMessage({
   onDelete,
   onRegenerate,
   onEdit,
+  failedReply,
+  failedReplyReason,
+  onRetryFailedReply,
+  replyCheckup,
   onSetActiveSwipe,
   onToggleHiddenFromAI,
   onPeekPrompt,
@@ -170,7 +184,11 @@ export const ConversationMessage = memo(function ConversationMessage({
   const [showThinking, setShowThinking] = useState(false);
   const [showGenerationReplay, setShowGenerationReplay] = useState(false);
   const [manuallyExpandedHidden, setManuallyExpandedHidden] = useState(false);
-  const [imageLightbox, setImageLightbox] = useState<{ url: string; prompt?: string | null } | null>(null);
+  const [imageLightbox, setImageLightbox] = useState<{
+    url: string;
+    prompt?: string | null;
+    galleryId?: string | null;
+  } | null>(null);
   const editRef = useRef<HTMLTextAreaElement>(null);
   const msgRef = useRef<HTMLDivElement>(null);
   const thinkingButtonRef = useRef<HTMLButtonElement>(null);
@@ -205,7 +223,10 @@ export const ConversationMessage = memo(function ConversationMessage({
     ? "text-[var(--primary)] bg-[var(--primary)]/15 ring-1 ring-[var(--primary)]/30 hover:text-[var(--primary)] hover:bg-[var(--primary)]/20"
     : undefined;
   const messageTextStyle = useMemo<CSSProperties>(
-    () => ({ fontSize: `${chatFontSize}px`, ...(chatFontColor ? { color: chatFontColor } : {}) }),
+    () => ({
+      fontSize: `${chatFontSize}px`,
+      ...(chatFontColor ? { color: `var(--mari-chat-resolved-text, ${chatFontColor})` } : {}),
+    }),
     [chatFontSize, chatFontColor],
   );
 
@@ -930,7 +951,7 @@ export const ConversationMessage = memo(function ConversationMessage({
     onCopy: handleCopy,
     onTranslate: handleTranslate,
     onStartEdit: handleStartEdit,
-    onImageOpen: (url, prompt) => setImageLightbox({ url, prompt }),
+    onImageOpen: (url, prompt, galleryId) => setImageLightbox({ url, prompt, galleryId }),
     onRemoveAttachment: handleRemoveAttachment,
     onSetActiveSwipe: handleSetActiveSwipe,
     onRegenerate,
@@ -989,7 +1010,28 @@ export const ConversationMessage = memo(function ConversationMessage({
           onClose={() => setShowGenerationReplay(false)}
         />
       )}
+      {imageLightbox?.galleryId ? (
+        // Generated images saved to the chat gallery get the shared lightbox, which can regenerate them (#7767).
+        <ChatImageLightbox
+          image={{
+            id: imageLightbox.galleryId,
+            chatId: message.chatId,
+            filePath: "",
+            prompt: imageLightbox.prompt ?? "",
+            provider: "",
+            model: "",
+            width: null,
+            height: null,
+            createdAt: message.createdAt,
+            url: imageLightbox.url,
+          }}
+          pinEnabled={false}
+          regenerate={{ messageId: message.id }}
+          onClose={() => setImageLightbox(null)}
+        />
+      ) : null}
       {imageLightbox &&
+        !imageLightbox.galleryId &&
         createPortal(
           <ConversationMessageLightbox
             url={imageLightbox.url}
@@ -1102,11 +1144,22 @@ export const ConversationMessage = memo(function ConversationMessage({
     );
   }
 
+  const sceneInvitation =
+    !isUser && !isStreaming && !editing && !isHiddenCollapsed && extra.sceneRequest ? (
+      <ConversationSceneInvitation chatId={message.chatId} request={extra.sceneRequest} />
+    ) : null;
+
+  // Conversation replies show no model label, so the marker gets its own line under the reply (#7697).
+  const fallback = isUser ? null : extra.generationInfo?.fallback;
+
   // ── Grouped multi-speaker layout ──
   if (groupedLayoutActive) {
     return (
       <>
         <ConversationMessageGrouped ctx={ctx} msgRef={msgRef} reactionRow={reactionRow} />
+        <GenerationFallbackMarker fallback={fallback} className="flex w-fit px-4" />
+        {replyCheckup && <div className="px-4">{replyCheckup}</div>}
+        {sceneInvitation}
         {modals}
       </>
     );
@@ -1149,9 +1202,29 @@ export const ConversationMessage = memo(function ConversationMessage({
             {isBubbleStyle ? <ConversationMessageBubble ctx={ctx} /> : <ConversationMessageLine ctx={ctx} />}
           </div>
 
+          {sceneInvitation}
           <ConversationMessageSwipes ctx={ctx} />
         </div>
         <div className="px-4">
+          <MessageMarkIndicators message={message} className="px-1" />
+          <GenerationFallbackMarker fallback={fallback} className="flex w-fit px-1" />
+          {!isUser && replyCheckup && <div className="px-1">{replyCheckup}</div>}
+          {isUser && failedReply && (
+            <p className="mari-send-failed" role="alert" title={failedReplyReason}>
+              <AlertTriangle size="0.8rem" aria-hidden="true" />
+              <button
+                type="button"
+                className="mari-send-failed__text bg-transparent p-0 text-start"
+                onClick={() => failedReplyReason && toast(failedReplyReason)}
+              >
+                {localizeUi("ui.chat.conversationmessage.failedReply")}
+              </button>
+              <span aria-hidden="true">·</span>
+              <button type="button" onClick={onRetryFailedReply} className="mari-link">
+                {localizeUi("ui.chat.conversationmessage.retryFailedReply")}
+              </button>
+            </p>
+          )}
           {reactionRow}
           {(!hideActions || (hasReasoning && !isUser)) && (
             <ConversationMessageActions

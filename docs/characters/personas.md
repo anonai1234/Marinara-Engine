@@ -20,12 +20,13 @@ The **Personas** panel is your persona library. Open it from the person icon in 
 
 The panel gives you these controls:
 
-- **Open Full Library** opens the responsive full-page Persona Library. It uses the same grid-and-preview layout as the Character Library, with persona descriptions, card sections, tags, and token estimates.
+- **Download** opens the [Card Browser](bot-browser.md), where you can also find personas on PlotLight.
+- **Open Library** opens the responsive full-page Persona Library. It uses the same grid-and-preview layout as the Character Library, with persona descriptions, card sections, tags, and token estimates.
 - **New** creates a persona.
 - **Import** opens the **Import Persona** window.
 - **Select** turns on bulk-selection mode so you can act on many personas at once.
 - The search box, with placeholder **Search personas**, matches name, description, comment, and tags.
-- The sort dropdown offers **A-Z**, **Z-A**, **Newest**, **Oldest**, and **Tokens** (estimated prompt size).
+- The sort dropdown offers **Manual order**, **A-Z**, **Z-A**, **Newest**, **Oldest**, and **Tokens** (estimated prompt size). **Manual order** keeps the order you set: drag a row up or down, or press Alt+Up or Alt+Down on a focused row. On a touch screen, press and hold a row to pick it up.
 - **New Folder** creates a folder to organize personas.
 - A **Tags** chip expands the tag list for filtering.
 
@@ -82,6 +83,7 @@ The **Card** tab is where you write the core persona fields. Each field is a lar
 - **Personality**: your temperament, behavior, speech habits, and emotional patterns.
 - **Backstory**: your history, origin, relationships, and formative events.
 - **Appearance**: physical description, clothing, and visual details the model should remember.
+- **Image Appearance Override**: an optional switch under **Appearance**, off by default. Turn it on to reveal a second box for short image tags that describe your persona, such as a LoRA trigger word. While it is on and the box is filled, image prompts use those tags exactly as written, with **Appearance** kept as background. The narrator always sees the full **Appearance** text.
 - **Scenario**: your default situation or context for roleplays. Use it to establish where your persona starts.
 
 These text boxes support macros. Quote characters you type are auto-formatted to match your app quote style.
@@ -119,6 +121,8 @@ The **Stats** tab has two separate blocks. Both feed the on-screen stat display 
 
 - **Enable Persona Stats** turns on status bars for needs like hunger, energy, and mood. When you enable it fresh, you get starter bars for Satiety, Energy, Hygiene, and Mood, each at 100 of 100. The **Persona Stats** agent adjusts these values as the story goes.
 - **Enable RPG Attributes** turns on RPG-style Pools and Attributes. When you enable it fresh, you get starter HP and MP Pools at 100 out of 100 and starter Attributes STR, DEX, CON, INT, WIS, and CHA at 10. These values are sent with the persona card for Combat and Game Mode, and for optional rolls in Roleplay or Game Mode. Tracker agents do not update them.
+
+When a Game Mode ruleset is installed, or the persona still holds a sheet for a ruleset you no longer have, a **Ruleset sheets** block appears below these two. It holds your persona's starting build for each ruleset, which a new game on that ruleset copies. See [Ruleset sheets](colors-and-stats.md#ruleset-sheets).
 
 The values you set here are the starting defaults for new chats. Persona Status Bars can update automatically when the Persona Stats agent is enabled; persona RPG Pools and Attributes are not agent-managed. For the full explanation, see [Character Colors and RPG Stats](colors-and-stats.md).
 
@@ -162,8 +166,8 @@ Each file shows a success or failure icon and a message. A summary line shows ho
 
 You can export from the **Export persona** icon in the **Persona Editor**, or with the bulk **Export** action in the panel's selection mode. The **Export Persona** window offers two formats:
 
-- **Native**: keeps all Marinara persona details, sprites, and attached lorebooks. Use this to move a persona between Marinara installs.
-- **Compatible**: exports plain persona fields only. Use this for other tools that do not understand Marinara's format.
+- **Marinara Native**: keeps all Marinara persona details, sprites, and attached lorebooks. Use this to move a persona between Marinara installs.
+- **Compatible JSON**: exports plain persona fields only. Use this for other tools that do not understand Marinara's format.
 
 A bulk export downloads a single zip file with one file per selected persona.
 

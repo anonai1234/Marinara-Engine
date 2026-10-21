@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import { prepareAdvancedMemoryContext } from "../../packages/server/src/services/generation/advanced-memory-context.js";
-import { createAdvancedMemoryPlacement } from "../../packages/server/src/services/prompt/advanced-memory-prompt.js";
+import {
+  createAdvancedMemoryPlacement,
+  describeAdvancedMemoryPlacements,
+  resolveAdvancedMemoryPrompt,
+} from "../../packages/server/src/services/prompt/advanced-memory-prompt.js";
 import { fitMessagesToContext, measureContextBudget } from "../../packages/server/src/services/llm/base-provider.js";
 
 const settings = {
@@ -8,7 +12,11 @@ const settings = {
   maxContextTokens: 65_000,
   summaryBudgetTokens: 4096,
   helperConnectionId: null,
+  decisionEnabled: false,
+  decisionConnectionId: null,
   initialProcessingModel: "helper" as const,
+  sceneCheckInterval: 5,
+  retrieveMaxScenes: 3,
   retrieveMinMessages: 3,
   retrieveMaxMessages: 10,
   narratorCharacterId: null,
@@ -33,11 +41,15 @@ const prompt: Input["messages"] = [
   },
   ...source.map((item) => ({ ...item, role: item.role as "user" | "assistant", contextKind: "history" as const })),
 ];
-const calls: Array<{ budget: number; readOnly?: boolean }> = [];
+const calls: Array<{ budget: number; readOnly?: boolean; decisionDeadline?: number }> = [];
 let recall = "";
+let cacheValid = true;
 const service = {
+  async validatePrepared() {
+    if (!cacheValid) throw new Error("Memory sources changed");
+  },
   async prepare(input: Parameters<Input["service"]["prepare"]>[0]) {
-    calls.push({ budget: input.budgetTokens, readOnly: input.readOnly });
+    calls.push({ budget: input.budgetTokens, readOnly: input.readOnly, decisionDeadline: input.decisionDeadline });
     const count = Math.min(source.length, Math.max(1, Math.floor((input.budgetTokens - 256) / 1010)));
     return {
       messageIds: source.slice(-count).map((item) => item.id),
@@ -61,7 +73,21 @@ const service = {
         checkpointId: "checkpoint",
         recalledSceneIds: [],
         recalledMessageIds: recall ? ["older-promise"] : [],
-        reasons: [],
+        reasons: recall ? ["decision-recall", "decision-excerpt-fallback", "excerpt-no-room"] : [],
+        ...(recall
+          ? {
+              decisionRecall: {
+                createdAt: "2026-01-01T00:00:00.000Z",
+                model: "fixture",
+                sourceEndMessageId: null,
+                fallback: false,
+                threshold: 0.5,
+                omittedCount: 0,
+                results: [],
+                notes: ["excerpt-no-room"],
+              },
+            }
+          : {}),
       },
     };
   },
@@ -86,11 +112,87 @@ assert.equal(
 );
 assert.equal(calls.length, 1);
 assert.ok(!roomy.providerMessages.some((message) => message.content.includes("__MARINARA_ADVANCED_MEMORY_")));
+const generousReply = await prepareAdvancedMemoryContext({ ...input, maxTokens: 32768, maxContext: 128000 });
+assert.equal(calls.at(-1)!.budget, calls[0]!.budget, "reply allowance does not consume the 65k outgoing prompt limit");
+assert.equal(generousReply.maxTokens, 32768);
+assert.equal(generousReply.receipt.budgetTokens, 65000);
+assert(measureContextBudget(generousReply.providerMessages, { maxContext: 128000, maxTokens: 32768 }).fits);
+calls.pop();
+const reused = await prepareAdvancedMemoryContext({ ...input, cachedSnapshots: [roomy.snapshot] });
+assert.equal(calls.length, 1, "a valid swipe snapshot bypasses memory preparation");
+assert.deepEqual(reused.providerMessages, roomy.providerMessages);
+assert(
+  !roomy.snapshot.prepared.receipt.reasons.includes("reused-swipe-memory"),
+  "reuse cannot mutate the saved original",
+);
+const introduction =
+  "Included below are recalled memories of scenes from the past chat history, together with small message excerpts from them. Present message range in the context is: #20–#22, with the last user message being #21.";
+const legacyParts = {
+  recalledScenes: `${introduction}\n\nScene summary:\nEARLIER_SCENE_WITHOUT_EXCERPT`,
+  recalledMessages: `${introduction}\n\nScene summary:\nLATER_SCENE\n\nExcerpt:\nMessages #10–#12;\nEXACT_PAST_WORDS`,
+};
+for (const format of ["xml", "markdown", "none"] as const) {
+  for (const authored of [[], ["recalled_messages"], ["recalled_scenes"], ["recalled_messages", "recalled_scenes"]]) {
+    const recallPlacements = (["recalled_messages", "recalled_scenes"] as const).map((type) =>
+      createAdvancedMemoryPlacement(
+        type,
+        format,
+        authored.includes(type)
+          ? { id: type, name: type === "recalled_messages" ? "Recalled Messages" : "Recalled Scenes", role: "system" }
+          : undefined,
+      ),
+    );
+    const slots = recallPlacements.map((placement) => ({ content: placement.token }));
+    const resolved = resolveAdvancedMemoryPrompt(slots, recallPlacements, legacyParts);
+    assert.equal(resolved.length, 1, "both old recall components render in one section");
+    const text = resolved[0]!.content;
+    assert.equal(text.split(introduction).length - 1, 1, "the shared introduction appears once");
+    assert(text.indexOf("EARLIER_SCENE_WITHOUT_EXCERPT") < text.indexOf("LATER_SCENE"));
+    assert(text.indexOf("LATER_SCENE") < text.indexOf("EXACT_PAST_WORDS"));
+    assert.doesNotMatch(text, /Recalled Messages|recalled_messages|MARINARA_ADVANCED_MEMORY/);
+    if (format === "xml") assert.equal(text.match(/<recalled_scenes>/g)?.length, 1);
+    if (format === "markdown") assert.equal(text.match(/^## Recalled Scenes$/gm)?.length, 1);
+    const described = describeAdvancedMemoryPlacements(slots, recallPlacements);
+    assert.equal(described.length, 1, "the receipt reports only the effective recall slot");
+    assert.equal(
+      described[0]!.markerType,
+      authored.length === 1 && authored[0] === "recalled_messages" ? "recalled_messages" : "recalled_scenes",
+      "the canonical authored marker wins, with the old marker retained as an alias",
+    );
+  }
+}
+const legacySnapshot = structuredClone(roomy.snapshot);
+Object.assign(legacySnapshot.prepared, legacyParts);
+const reusedLegacy = await prepareAdvancedMemoryContext({ ...input, cachedSnapshots: [legacySnapshot] });
+assert.equal(calls.length, 1, "formatting old swipe memory must not search or prepare again");
+const legacyText = reusedLegacy.providerMessages.map((message) => message.content).join("\n");
+assert.equal(legacyText.split(introduction).length - 1, 1);
+assert.equal(legacyText.match(/<recalled_scenes>/g)?.length, 1);
+assert.doesNotMatch(legacyText, /<recalled_messages>/);
+assert.deepEqual(legacySnapshot.prepared.recalledMessages, legacyParts.recalledMessages);
+const beforeInvalid = calls.length;
+for (const cachedSnapshot of [
+  { ...roomy.snapshot, prepared: null },
+  { ...roomy.snapshot, audienceCharacterIds: ["another-character"] },
+  { ...roomy.snapshot, audienceMode: "owner" },
+]) {
+  await prepareAdvancedMemoryContext({ ...input, cachedSnapshots: [cachedSnapshot] });
+}
+assert.equal(calls.length, beforeInvalid + 3, "malformed and differently scoped snapshots are not reused");
+cacheValid = false;
+await prepareAdvancedMemoryContext({ ...input, cachedSnapshots: [roomy.snapshot] });
+assert.equal(calls.length, beforeInvalid + 4, "changed sources or access require fresh preparation");
+cacheValid = true;
 
 recall = "Optional old promise ".repeat(3000);
 const limited = await prepareAdvancedMemoryContext({ ...input, maxContext: 12_000 });
 assert.ok(limited.messages.length < roomy.messages.length);
 assert.equal(limited.receipt.recalledMessageIds.length, 0, "discard optional excerpts before further cutting history");
+assert.deepEqual(
+  [limited.receipt.reasons.slice(0, -1), limited.receipt.decisionRecall!.notes],
+  [["decision-recall"], undefined],
+  "once no scene is recalled, no reason about a recalled scene's excerpt is shown",
+);
 assert.deepEqual(
   limited.receipt.recordRevisions,
   { "continuity-variant": "continuity-revision", "temporary-variant": "temporary-revision" },
@@ -99,12 +201,34 @@ assert.deepEqual(
 assert.equal(limited.messages.filter((message) => message.content.includes("Earlier events remain")).length, 1);
 assert.ok(measureContextBudget(limited.providerMessages, { maxContext: 12_000, maxTokens: 4096 }).fits);
 assert.ok(limited.providerMessages.some((message) => message.content.includes("Character rules")));
+assert.equal(limited.snapshot.prepared.recalledMessages, null, "a saved snapshot contains only memory actually sent");
+const beforeLimitedReuse = calls.length;
+const reusedLimited = await prepareAdvancedMemoryContext({ ...input, cachedSnapshots: [limited.snapshot] });
+assert.equal(calls.length, beforeLimitedReuse);
+assert(!JSON.stringify(reusedLimited.providerMessages).includes("Optional old promise"));
+const tighter = await prepareAdvancedMemoryContext({ ...input, cachedSnapshots: [roomy.snapshot], maxContext: 12_000 });
+assert(calls.length > beforeLimitedReuse, "a saved history that exceeds a new context cap must be refitted");
+assert(measureContextBudget(tighter.providerMessages, { maxContext: 12_000, maxTokens: 4096 }).fits);
 
 recall = "";
 const preview = await prepareAdvancedMemoryContext({ ...input, readOnly: true });
 assert.equal(calls.at(-1)!.readOnly, true);
 assert.deepEqual(preview.providerMessages, roomy.providerMessages);
 assert.ok(prompt[0]!.content.includes(placements[0]!.token), "prepared snapshot must stay reusable");
+
+// Formatting can outgrow the estimate, so the history is refitted; every attempt for the reply shares one
+// Decision recall time limit.
+const beforeFormatted = calls.length;
+await prepareAdvancedMemoryContext({
+  ...input,
+  maxContext: 12_000,
+  toProviderMessages: (messages) =>
+    messages.map((message) => ({ ...message, content: `${message.content}${"y".repeat(200)}` })),
+});
+const deadlines = calls.slice(beforeFormatted).map((call) => call.decisionDeadline);
+assert(deadlines.length > 1, "the formatted history is refitted");
+assert.equal(new Set(deadlines).size, 1, "one Decision recall time limit per reply");
+assert.equal(typeof deadlines[0], "number");
 
 const synthetic = {
   role: "user" as const,

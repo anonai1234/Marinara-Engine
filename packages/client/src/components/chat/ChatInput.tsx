@@ -31,7 +31,7 @@ import { useApplyRegex } from "../../hooks/use-apply-regex";
 import { useInstalledCapabilityPackages } from "../../hooks/use-capability-packages";
 import { useCreateMessage, useDeleteMessage, useUpdateMessageExtra, chatKeys } from "../../hooks/use-chats";
 import { useConnections } from "../../hooks/use-connections";
-import { characterKeys } from "../../hooks/use-characters";
+import { characterKeys, ensureCharacterAndPersonaLists } from "../../hooks/use-characters";
 import {
   buildGuidedGenerationInstructionMessage,
   formatTextQuotes,
@@ -46,10 +46,11 @@ import {
   shouldExecuteQuickPostAsCommand,
   getSlashCompletions,
   getSlashCommandUsage,
+  withComposerReplyAndAttachments,
   type SlashCommand,
   type SlashCommandContext,
 } from "../../lib/slash-commands";
-import { createInputMacroResolverForChat, isPromptPreviewMacro } from "../../lib/chat-macros";
+import { isPromptPreviewMacro, prepareUserInputMessage } from "../../lib/chat-macros";
 import { parseChatMetadata } from "../../lib/chat-display";
 import type { AvatarCrop } from "@marinara-engine/shared";
 import { cn, getAvatarCropStyle } from "../../lib/utils";
@@ -201,7 +202,7 @@ interface ChatInputProps {
     options?: { immediate?: boolean },
   ) => void | Promise<void>;
   onPeekPrompt?: () => void;
-  onIllustrate?: (prompt?: string) => void | Promise<void>;
+  onIllustrate?: (prompt?: string, messageRange?: [string, string]) => void | Promise<void>;
   combatAgentEnabled?: boolean;
   onStartEncounter?: () => void;
   interactionsLocked?: boolean;
@@ -788,6 +789,24 @@ export const ChatInput = memo(function ChatInput({
   // Get the current textarea value (always from the DOM directly)
   const getValue = () => textareaRef.current?.value ?? "";
 
+  const prepareUserMessage = useCallback(
+    async (text: string, onTranslationError: () => void) => {
+      const chat = useChatStore.getState().activeChat;
+      // Only typed macros wait for the lists, so a plain message never waits on a slow first load.
+      // ponytail: a macro that a regex script or translation adds still falls back to "User" on that
+      // first load; also check the chat's regex replacements here if that case ever matters.
+      if (text.includes("{{")) await ensureCharacterAndPersonaLists(qc);
+      return prepareUserInputMessage(text, {
+        chat,
+        characters: qc.getQueryData<Array<{ id: string; data: unknown }>>(characterKeys.list()),
+        personas: qc.getQueryData<Persona[]>(characterKeys.personas),
+        applyToUserInput,
+        onTranslationError,
+      });
+    },
+    [applyToUserInput, qc],
+  );
+
   const buildContext = useCallback((): SlashCommandContext | null => {
     if (!activeChatId) return null;
     return {
@@ -804,6 +823,10 @@ export const ChatInput = memo(function ChatInput({
         await createMessage.mutateAsync(data);
         requestChatScrollToBottom({ chatId: activeChatId, behavior: "auto" });
       },
+      prepareUserMessage: (text) =>
+        prepareUserMessage(text, () =>
+          toast.error(localizeUi("ui.chat.chatinput.failedToTranslateMessagePostingOriginal")),
+        ),
       invalidate: () => qc.invalidateQueries({ queryKey: chatKeys.all }),
       invalidateCharacter: (characterId) => qc.invalidateQueries({ queryKey: characterKeys.detail(characterId) }),
       characterNames: activeCharacterNames,
@@ -823,6 +846,8 @@ export const ChatInput = memo(function ChatInput({
     mode,
     generateWithNarrativeDirector,
     createMessage,
+    prepareUserMessage,
+    localizeUi,
     activeCharacterNames,
     activeChatCharacters,
     canSubmitSpatialMove,
@@ -969,7 +994,10 @@ export const ChatInput = memo(function ChatInput({
       clearInputDraft(activeChatId);
 
       try {
-        const result = await match.command.execute(match.args, ctx);
+        const result = await match.command.execute(
+          match.args,
+          withComposerReplyAndAttachments(ctx, { replyTo: replyDraft, attachments: submittedAttachments }),
+        );
         if (result.feedback) {
           setFeedback(result.feedback);
         }
@@ -1006,27 +1034,9 @@ export const ChatInput = memo(function ChatInput({
       return;
     }
 
-    const cachedCharacters = qc.getQueryData<Array<{ id: string; data: unknown }>>(characterKeys.list());
-    const cachedPersonas = qc.getQueryData<Persona[]>(characterKeys.personas);
-    const resolveInputMacros = createInputMacroResolverForChat(chat, cachedCharacters, cachedPersonas, normalized);
-    const chatMeta = parseChatMetadata(chat?.metadata);
-    let message = applyToUserInput(normalized, {
-      resolveMacros: resolveInputMacros,
-      scopedMode: chatMeta.scopedRegexMode,
-    });
-
-    // Input translation: translate user's message before sending
-    if (chatMeta.translateInput && message.trim()) {
-      try {
-        const { translateText } = await import("../../lib/translate-text");
-        const translated = await translateText(message, "input");
-        if (translated.trim()) message = translated;
-      } catch {
-        toast.error(localizeUi("ui.chat.chatinput.failedToTranslateMessageSendingOriginal"));
-      }
-    }
-
-    message = resolveInputMacros(message);
+    const message = await prepareUserMessage(normalized, () =>
+      toast.error(localizeUi("ui.chat.chatinput.failedToTranslateMessageSendingOriginal")),
+    );
 
     const submittingChatId = activeChatId;
     const submittedDraft = textareaRef.current?.value ?? "";
@@ -1130,7 +1140,7 @@ export const ChatInput = memo(function ChatInput({
     mode,
     isInputBusy,
     generateWithNarrativeDirector,
-    applyToUserInput,
+    prepareUserMessage,
     buildContext,
     qc,
     clearInputDraft,
@@ -1264,27 +1274,9 @@ export const ChatInput = memo(function ChatInput({
       draftTimerRef.current = null;
     }
 
-    const chat = useChatStore.getState().activeChat;
-    const cachedCharacters = qc.getQueryData<Array<{ id: string; data: unknown }>>(characterKeys.list());
-    const cachedPersonas = qc.getQueryData<Persona[]>(characterKeys.personas);
-    const resolveInputMacros = createInputMacroResolverForChat(chat, cachedCharacters, cachedPersonas, normalized);
-    const chatMeta = parseChatMetadata(chat?.metadata);
-    let message = applyToUserInput(normalized, {
-      resolveMacros: resolveInputMacros,
-      scopedMode: chatMeta.scopedRegexMode,
-    });
-
-    if (chatMeta.translateInput && message.trim()) {
-      try {
-        const { translateText } = await import("../../lib/translate-text");
-        const translated = await translateText(message, "input");
-        if (translated.trim()) message = translated;
-      } catch {
-        toast.error(localizeUi("ui.chat.chatinput.failedToTranslateMessagePostingOriginal"));
-      }
-    }
-
-    message = resolveInputMacros(message);
+    const message = await prepareUserMessage(normalized, () =>
+      toast.error(localizeUi("ui.chat.chatinput.failedToTranslateMessagePostingOriginal")),
+    );
     const submittedDraft = raw;
     const submittedHeight = textareaRef.current?.style.height ?? "auto";
     const submittedAttachments = attachments;
@@ -1328,7 +1320,7 @@ export const ChatInput = memo(function ChatInput({
       let rollbackFailed = false;
       if (createdMessageId) {
         try {
-          await deleteMessage.mutateAsync(createdMessageId);
+          await deleteMessage.mutateAsync({ messageId: createdMessageId, skipTrash: true });
         } catch {
           rollbackFailed = true;
         }
@@ -1365,8 +1357,7 @@ export const ChatInput = memo(function ChatInput({
     isReadingAttachments,
     attachments,
     completions,
-    applyToUserInput,
-    qc,
+    prepareUserMessage,
     syncInputState,
     clearInputDraft,
     setInputDraft,
@@ -1703,27 +1694,28 @@ export const ChatInput = memo(function ChatInput({
     [syncInputState],
   );
 
-  // Character picker: trigger a response from a specific character (manual mode)
+  // An omitted target asks the existing Smart selector for this response only.
   const handleCharacterResponse = useCallback(
-    async (characterId: string) => {
+    async (characterId?: string) => {
       if (!activeChatId || isInputBusy) return;
       setCharPickerOpen(false);
       setCharPickerPos(null);
-      if (responseQueue.includes(characterId)) {
+      if (characterId && responseQueue.includes(characterId)) {
         removeFromResponseQueue(activeChatId, characterId);
       }
       const guideText = getValue();
+      const responder = characterId ? { forCharacterId: characterId } : { smartResponse: true };
       try {
         await generateWithNarrativeDirector(
           guideGenerations && hasInput
             ? {
                 chatId: activeChatId,
                 connectionId: null,
-                forCharacterId: characterId,
+                ...responder,
                 generationGuide: buildGuidedGenerationInstructionMessage(guideText),
                 generationGuideSource: "guide",
               }
-            : { chatId: activeChatId, connectionId: null, forCharacterId: characterId },
+            : { chatId: activeChatId, connectionId: null, ...responder },
         );
       } catch (error) {
         const msg = error instanceof Error ? error.message : "Generation failed";
@@ -1844,7 +1836,10 @@ export const ChatInput = memo(function ChatInput({
     <div className="mari-chat-input chat-input-container px-3 pb-3">
       {/* Slash command autocomplete popup */}
       {completions.length > 0 && (
-        <div className="mb-2 max-h-[min(18rem,45dvh)] overflow-y-auto rounded-xl border border-foreground/10 bg-[var(--card)] shadow-xl backdrop-blur-xl [-webkit-overflow-scrolling:touch]">
+        <div
+          data-chat-input-popup="commands"
+          className="mari-chat-style-surface mari-chat-input-popup mb-2 max-h-[min(18rem,45dvh)] overflow-y-auto rounded-xl border border-foreground/10 bg-[var(--card)] shadow-xl backdrop-blur-xl [-webkit-overflow-scrolling:touch]"
+        >
           {completions.map((cmd, i) => (
             <button
               key={cmd.name}
@@ -1938,7 +1933,8 @@ export const ChatInput = memo(function ChatInput({
               {pushStoryMenuOpen && (
                 <div
                   role="menu"
-                  className="absolute bottom-full left-1/2 z-50 mb-2 w-64 -translate-x-1/2 rounded-xl border border-[var(--marinara-chat-chrome-panel-border)] bg-[var(--card)] p-1 shadow-2xl"
+                  data-chat-input-popup="story"
+                  className="mari-chat-style-surface mari-chat-input-popup absolute bottom-full left-1/2 z-50 mb-2 w-64 -translate-x-1/2 rounded-xl border border-[var(--marinara-chat-chrome-panel-border)] bg-[var(--card)] p-1 shadow-2xl"
                 >
                   <button
                     type="button"
@@ -2059,6 +2055,7 @@ export const ChatInput = memo(function ChatInput({
           dragging: isDragging,
           hasContent: hasInput || attachments.length > 0,
           layout: "roleplay",
+          className: isProfessorMariChat ? "mari-professor-composer" : undefined,
         })}
       >
         {/* Attachment button */}
@@ -2071,6 +2068,7 @@ export const ChatInput = memo(function ChatInput({
           onChange={handleFileUpload}
         />
         <button
+          type="button"
           onClick={() => fileInputRef.current?.click()}
           disabled={!activeChatId || isInputBusy}
           className={cn(
@@ -2080,6 +2078,7 @@ export const ChatInput = memo(function ChatInput({
               : "text-foreground/40 hover:bg-foreground/10 hover:text-foreground/70",
           )}
           title={t("chat.input.attachFiles")}
+          aria-label={t("chat.input.attachFiles")}
         >
           <Paperclip size="1rem" />
         </button>
@@ -2095,6 +2094,7 @@ export const ChatInput = memo(function ChatInput({
         <textarea
           ref={textareaRef}
           data-chat-composer="true"
+          data-chat-id={activeChatId}
           onInput={handleInput}
           onKeyDown={handleKeyDown}
           onKeyUp={handleKeyUp}
@@ -2110,6 +2110,10 @@ export const ChatInput = memo(function ChatInput({
           autoCorrect="on"
           className="mari-chat-input-textarea max-h-[12.5rem] min-w-0 flex-1 resize-none bg-transparent py-0 text-sm leading-normal text-foreground/90 placeholder:text-foreground/30 outline-none disabled:cursor-not-allowed disabled:opacity-40"
         />
+
+        {showQuickRepliesMenu && quickReplyActions.length > 0 && (
+          <QuickReplyMenu actions={quickReplyActions} disabled={!activeChatId || isInputBusy || isReadingAttachments} />
+        )}
 
         {/* Emoji picker */}
         <div className="relative hidden shrink-0 sm:block">
@@ -2128,6 +2132,7 @@ export const ChatInput = memo(function ChatInput({
             <Smile size="1.125rem" />
           </button>
           <EmojiPicker
+            popupClassName="mari-chat-style-surface mari-chat-input-popup"
             open={emojiOpen}
             onClose={() => setEmojiOpen(false)}
             onSelect={handleEmojiSelect}
@@ -2185,18 +2190,29 @@ export const ChatInput = memo(function ChatInput({
           />
         )}
 
-        {showQuickRepliesMenu && quickReplyActions.length > 0 && (
-          <QuickReplyMenu actions={quickReplyActions} disabled={!activeChatId || isInputBusy || isReadingAttachments} />
-        )}
-
         {/* Send / Stop button */}
 
         <button
+          type="button"
           onClick={isStreaming ? () => useChatStore.getState().stopGeneration(activeChatId ?? undefined) : handleSend}
           disabled={
             (!isStreaming && (isInputBusy || isReadingAttachments)) ||
             (!hasInput && !attachments.length && !canSubmitSpatialMove && !isStreaming && !canRetry && !canContinue) ||
             !activeChatId
+          }
+          aria-label={
+            isStreaming
+              ? t("chat.input.stopGenerating")
+              : isInputBusy
+                ? t("chat.input.waitForAgents")
+                : t("chat.input.send")
+          }
+          title={
+            isStreaming
+              ? t("chat.input.stopGenerating")
+              : isInputBusy
+                ? t("chat.input.waitForAgents")
+                : t("chat.input.send")
           }
           className={cn(
             "mari-chat-send-btn flex h-9 w-9 shrink-0 items-center justify-center rounded-xl transition-all duration-200 sm:h-8 sm:w-8",
@@ -2226,7 +2242,8 @@ export const ChatInput = memo(function ChatInput({
         createPortal(
           <div
             ref={charPickerMenuRef}
-            className="fixed z-[9999] flex min-w-[220px] max-w-[280px] max-h-[320px] flex-col overflow-hidden rounded-xl border border-foreground/10 bg-[var(--card)] shadow-2xl"
+            data-chat-input-popup="character"
+            className="mari-chat-style-surface mari-chat-input-popup fixed z-[9999] flex min-w-[220px] max-w-[280px] max-h-[320px] flex-col overflow-hidden rounded-xl border border-foreground/10 bg-[var(--card)] shadow-2xl"
             style={
               charPickerPos ? { left: charPickerPos.left, top: charPickerPos.top } : { visibility: "hidden" as const }
             }
@@ -2235,6 +2252,17 @@ export const ChatInput = memo(function ChatInput({
               {localizeUi("ui.chat.chatinput.triggerResponse")}
             </div>
             <div className="overflow-y-auto p-1">
+              {mode === "roleplay" && (groupResponseOrder === "smart" || groupResponseOrder === "manual") && (
+                <button
+                  onClick={() => handleCharacterResponse()}
+                  className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left transition-all hover:bg-foreground/10"
+                >
+                  <span className="flex h-7 w-7 shrink-0 items-center justify-center text-[var(--primary)]">
+                    <Users size="1rem" aria-hidden="true" />
+                  </span>
+                  <span className="text-sm">{localizeUi("ui.chat.chatinput.smartResponse")}</span>
+                </button>
+              )}
               {activeChatCharacters!.map((char) => {
                 const queuedOrder = queuedResponseOrder.get(char.id);
                 return (

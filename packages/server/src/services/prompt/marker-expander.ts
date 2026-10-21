@@ -24,11 +24,18 @@ import type {
 import { createCharactersStorage } from "../storage/characters.storage.js";
 import { createAgentsStorage } from "../storage/agents.storage.js";
 import { getCustomAgentImportPolicy } from "../agents/custom-agent-import-policy.service.js";
-import { processLorebooks, type LorebookFinalContentResolver, type LorebookScanResult } from "../lorebook/index.js";
+import {
+  processLorebooks,
+  type LorebookDecisionResolver,
+  type LorebookFinalContentResolver,
+  type LorebookScanResult,
+} from "../lorebook/index.js";
+import { COMMITTED_TRACKER_AGENT_TYPES } from "../generation/committed-tracker-context.js";
 import { cardPromptText } from "./card-text.js";
 import { wrapContent } from "./format-engine.js";
 import { advancedMemoryMarkerContent, type AdvancedMemoryPromptParts } from "./advanced-memory-prompt.js";
 import { sanitizeExampleDialoguePromptLeaf, sanitizePromptLeaf } from "./prompt-escaping.js";
+import { resolveChatSummaryMacros } from "./macro-context.js";
 
 /** World-info positions a lorebook marker can place: position 0 (before) and position 1 (after). */
 export type LorebookMarkerPosition = "before" | "after";
@@ -56,6 +63,8 @@ export interface MarkerContext {
   /** Optional scan-only messages for lorebook matching. */
   lorebookScanMessages?: ChatMLMessage[];
   chatSummary: string | null;
+  /** Characters a merged group reply may voice; the Chat Summary marks who knows what (#7252). */
+  chatSummaryReaders?: readonly CharacterMacroProfile[];
   advancedMemory?: AdvancedMemoryPromptParts;
   wrapFormat: WrapFormat;
   /** When false, agent_data markers expand to empty strings */
@@ -75,7 +84,7 @@ export interface MarkerContext {
   /** Pre-computed embedding of the chat context for semantic lorebook matching. */
   chatEmbedding?: number[] | null;
   /** Per-lorebook pre-computed embeddings for semantic lorebook matching. */
-  semanticEmbeddingsByLorebookId?: ReadonlyMap<string, number[] | null>;
+  semanticEmbeddingsByLorebookId?: ReadonlyMap<string, number[] | number[][] | null>;
   /** Provider/model/profile identity used to create semantic query vectors. */
   semanticEmbeddingSpaceId?: string | null;
   /** Unrelated-text cosine floor used to calibrate clustered embedding models. */
@@ -94,6 +103,8 @@ export interface MarkerContext {
   previewOnly?: boolean;
   /** Resolves prompt macros for final included lorebook entries. May apply macro side effects. */
   resolveLorebookContent?: LorebookFinalContentResolver;
+  /** Answers entries' decision statements (#6570); omitted, decision entries read as no. */
+  resolveLorebookDecisions?: LorebookDecisionResolver;
   /** Standard prompt macro context used before escaping marker leaf text. */
   macroCtx: MacroContext;
   /** Collector for lorebook depth entries — populated during expansion, consumed by the assembler. */
@@ -412,6 +423,7 @@ export async function ensureLorebookScan(ctx: MarkerContext): Promise<LorebookSc
         generationTriggers: ctx.generationTriggers ?? ["chat"],
         previewOnly: ctx.previewOnly === true,
         resolveContent: ctx.resolveLorebookContent,
+        resolveDecisions: ctx.resolveLorebookDecisions,
       },
     ));
 
@@ -573,7 +585,8 @@ async function expandDialogueExamples(_config: MarkerConfig, ctx: MarkerContext)
 // ── Chat Summary ───────────────────────────────
 
 function expandChatSummary(ctx: MarkerContext, macroOptions?: ResolveMacroOptions): ExpandedMarker {
-  return { content: resolveSanitizedPromptLeaf(ctx.chatSummary ?? "", ctx, ctx.macroCtx, macroOptions) };
+  const summary = resolveChatSummaryMacros(ctx.chatSummary ?? "", ctx.macroCtx, macroOptions, ctx.chatSummaryReaders);
+  return { content: sanitizePromptLeaf(summary, ctx.wrapFormat) };
 }
 
 // ── Agent Data ─────────────────────────────────
@@ -583,18 +596,9 @@ async function expandAgentData(config: MarkerConfig, ctx: MarkerContext): Promis
   const agentType = config.agentType;
   if (!agentType) return { content: "" };
 
-  // Tracker agent types are now always injected directly by the generation
-  // route (as a single formatted system message) regardless of preset
-  // configuration. Skip them here to avoid duplicate data.
-  const AUTO_INJECTED_TRACKERS = new Set([
-    "world-state",
-    "quest",
-    "character-tracker",
-    "persona-stats",
-    "custom-tracker",
-    "inventory-tracker",
-  ]);
-  if (AUTO_INJECTED_TRACKERS.has(agentType)) return { content: "" };
+  // Generation supplies committed tracker state through runtimeAgentData.
+  // Never fall back to a raw agent run, which can belong to a discarded swipe.
+  if (COMMITTED_TRACKER_AGENT_TYPES.has(agentType)) return { content: "" };
 
   // Generation only runs agents explicitly added to the chat. If none are active,
   // prompt sections must not keep replaying the last saved output forever.
